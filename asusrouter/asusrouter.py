@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-import aiohttp
 import asyncio
-from datetime import datetime
 import logging
-from typing import Any
+from datetime import datetime
+from typing import Any, Callable
+
+import aiohttp
 
 from asusrouter import (
     AsusDevice,
@@ -21,64 +22,113 @@ from asusrouter import (
     Monitor,
 )
 from asusrouter.const import (
-    AR_DEVICE_IDENTITY,
-    AR_FIRMWARE_CHECK_COMMAND,
-    AR_HOOK_DEVICES,
-    AR_KEY_AURARGB,
-    AR_KEY_CPU,
-    AR_KEY_DEVICES,
-    AR_KEY_LED,
-    AR_KEY_LEDG_COUNT,
+    ACTION_MODE,
+    AIMESH,
+    APPLY,
     AR_KEY_LEDG_RGB,
     AR_KEY_LEDG_SCHEME,
     AR_KEY_LEDG_SCHEME_OLD,
-    AR_KEY_NETWORK,
-    AR_KEY_PARENTAL_CONTROL,
-    AR_KEY_RAM,
-    AR_KEY_SERVICE_COMMAND,
-    AR_KEY_SERVICE_MODIFY,
-    AR_KEY_SERVICE_REPLY,
-    AR_KEY_VPN_CLIENT,
-    AR_KEY_WAN,
     AR_LEDG_MODE,
-    AR_MAP_PARENTAL_CONTROL,
-    AR_PATH,
-    AR_SERVICE_COMMAND,
-    AR_SERVICE_CONTROL,
-    AR_SERVICE_DROP_CONNECTION,
-    DATA_BY_CORE,
-    DATA_TOTAL,
-    DATA_USAGE,
-    DATA_USED,
-    DEFAULT_ACTION_MODE,
+    BOOTTIME,
+    CLIENTS,
+    CLIENTS_HISTORIC,
+    COMMAND,
+    CONNECTION_TYPE,
+    CONST_REQUIRE_MONITOR,
+    CONVERTERS,
+    CPU,
+    CPU_USAGE,
     DEFAULT_CACHE_TIME,
     DEFAULT_SLEEP_TIME,
+    DELIMITER_PARENTAL_CONTROL_ITEM,
+    DEVICEMAP,
+    DEVICES,
+    ENDHOOKS,
+    ENDPOINT,
+    ENDPOINTS,
+    ERRNO,
     ERROR_IDENTITY,
-    ERROR_SERVICE,
-    ERROR_SERVICE_UNKNOWN,
     ERROR_VALUE,
-    INTERFACE_TYPE,
-    KEY_ACTION_MODE,
-    KEY_CPU,
-    KEY_HOOK,
-    KEY_NETWORK,
-    KEY_RAM,
-    KEY_SYSINFO,
-    KEY_TEMPERATURE,
-    KEY_VPN,
-    KEY_WAN,
-    MONITOR_MAIN,
-    MSG_ERROR,
-    MSG_INFO,
-    MSG_SUCCESS,
-    NVRAM_LIST,
-    NVRAM_TEMPLATE,
+    ETHERNET_PORTS,
+    FIRMWARE,
+    GUEST,
+    GWLAN,
+    HD_DATA,
+    HOOK,
+    INFO,
+    IP,
+    ISO,
+    KEY_PARENTAL_CONTROL_MAC,
+    KEY_PARENTAL_CONTROL_STATE,
+    KEY_PARENTAL_CONTROL_TYPE,
+    KEY_PORT_FORWARDING_LIST,
+    KEY_PORT_FORWARDING_STATE,
+    LAN,
+    LED,
+    LED_VAL,
+    LEDG,
+    LIGHT,
+    LINK_RATE,
+    MAC,
+    MAIN,
+    MAP_CONNECTED_DEVICE,
+    MAP_IDENTITY,
+    MAP_NVRAM,
+    MAP_OVPN_STATUS,
+    MAP_PARENTAL_CONTROL_ITEM,
+    MAP_PARENTAL_CONTROL_TYPE,
+    MEMORY_USAGE,
+    MONITOR_REQUIRE_CONST,
+    NAME,
+    NETDEV,
+    NETWORK,
+    NODE,
+    NVRAM,
+    ONBOARDING,
+    ONLINE,
     PARAM_COLOR,
     PARAM_COUNT,
     PARAM_MODE,
-    PORT_TYPE,
+    PARENTAL_CONTROL,
+    PORT,
+    PORT_FORWARDING,
+    PORT_STATUS,
+    PORT_TYPES,
+    PORTS,
+    RAM,
+    RANGE_GWLAN,
+    RANGE_OVPN_CLIENTS,
+    RSSI,
+    RULES,
+    SERVICE_COMMAND,
+    SERVICE_MODIFY,
+    SERVICE_REPLY,
+    SERVICE_SET_LED,
+    SPEED_TYPES,
+    STATE,
+    STATUS,
+    SYS,
+    SYSINFO,
+    TEMPERATURE,
+    TIMEMAP,
+    TIMESTAMP,
+    TOTAL,
     TRACK_SERVICES_LED,
+    TYPE,
+    UNKNOWN,
+    UPDATE_CLIENTS,
+    USB,
+    USED,
+    VPN,
+    VPN_CLIENT,
+    WAN,
+    WANLINK_STATE,
+    WLAN,
+    WLAN_TYPE,
+    Merge,
 )
+from asusrouter.dataclass import AiMeshDevice, ConnectedDevice, PortForwarding
+from asusrouter.error import AsusRouterDataProcessError
 from asusrouter.util import calculators, compilers, converters, parsers
 
 _LOGGER = logging.getLogger(__name__)
@@ -94,11 +144,7 @@ class AsusRouter:
         password: str | None = None,
         port: int | None = None,
         use_ssl: bool = False,
-        cert_check: bool = True,
-        cert_path: str = "",
         cache_time: int = DEFAULT_CACHE_TIME,
-        enable_monitor: bool = True,
-        enable_control: bool = False,
         session: aiohttp.ClientSession | None = None,
     ):
         """Init"""
@@ -106,23 +152,37 @@ class AsusRouter:
         self._host: str = host
 
         self._cache_time: int = cache_time
-        self._enable_monitor: bool = enable_monitor
-        self._enable_control: bool = enable_control
 
-        self._device_cpu_cores: list[int] | None = None
-        self._device_ports: dict[str, str] | None = None
-        self._device_boottime: datetime | None = None
-
-        self._monitor_main: Monitor = Monitor()
-        self._monitor_nvram: Monitor = Monitor()
-        self._monitor_misc: Monitor = Monitor()
-        self._monitor_devices: Monitor = Monitor()
+        # Monitors
+        self.monitor: dict[str, Monitor] = {
+            endpoint: Monitor() for endpoint in ENDPOINT
+        }
+        # Monitor arguments
+        self.monitor_arg = {}
+        for key, value in ENDHOOKS.items():
+            self.monitor[key] = Monitor()
+            if value:
+                self.monitor_arg[key] = f"hook={compilers.hook(value)}"
+            else:
+                self.monitor[key].ready = False
+        self._init_monitor_methods()
+        self._init_monitor_requirements()
+        # Constants
+        self.constant = {}
 
         self._identity: AsusDevice | None = None
         self._ledg_color: dict[int, dict[str, int]] | None = None
         self._ledg_count: int = 0
         self._ledg_mode: int | None = None
-        self._status_led: bool = False
+
+        # State values
+        self._state_led: bool = False
+
+        # Flags
+        self._flag_reboot: bool = False
+
+        # Endpoint switch
+        self._endpoint_devices: str = UPDATE_CLIENTS
 
         """Connect"""
         self.connection = Connection(
@@ -131,20 +191,57 @@ class AsusRouter:
             password=password,
             port=port,
             use_ssl=use_ssl,
-            cert_check=cert_check,
-            cert_path=cert_path,
             session=session,
         )
 
-    ### MAIN CONTROL -->
+    def _init_monitor_methods(self) -> None:
+        """Initialize monitors"""
+
+        self.monitor_method = {
+            DEVICEMAP: self._process_monitor_devicemap,
+            DEVICES: self._process_monitor_devices,
+            ETHERNET_PORTS: self._process_monitor_ethernet_ports,
+            FIRMWARE: self._process_monitor_firmware,
+            LIGHT: self._process_monitor_light,
+            MAIN: self._process_monitor_main,
+            NVRAM: self._process_monitor_nvram,
+            ONBOARDING: self._process_monitor_onboarding,
+            PARENTAL_CONTROL: self._process_monitor_parental_control,
+            PORT_STATUS: self._process_monitor_port_status,
+            PORT_FORWARDING: self._process_monitor_port_forwarding,
+            SYSINFO: self._process_monitor_sysinfo,
+            TEMPERATURE: self._process_monitor_temperature,
+            UPDATE_CLIENTS: self._process_monitor_update_clients,
+            VPN: self._process_monitor_vpn,
+        }
+
+    def _init_monitor_requirements(self) -> None:
+        """Initialize monitor requirements"""
+
+        self.monitor_compile = {
+            NVRAM: self._compile_monitor_nvram,
+        }
+
+    def _mark_reboot(self) -> None:
+        """Mark reboot"""
+
+        self._flag_reboot = True
+
+    async def _check_flags(self) -> None:
+        """Check flags"""
+
+        if self._flag_reboot:
+            await self.async_handle_reboot()
+
+    # MAIN CONTROL -->
 
     async def async_check_endpoint(self, endpoint: str) -> bool:
         """Check if endpoint exists"""
 
         try:
-            result = await self.connection.async_load(endpoint)
+            await self.async_api_load(endpoint)
             return True
-        except AsusRouter404:
+        except (AsusRouter404, AsusRouterDataProcessError):
             return False
 
     async def async_connect(self) -> bool:
@@ -190,28 +287,30 @@ class AsusRouter:
     async def async_identify(self) -> None:
         """Identify the device"""
 
-        _LOGGER.debug(MSG_INFO["identifying"])
+        _LOGGER.debug("Identifying the device")
 
         # Compile
-        query = list()
-        for item in AR_DEVICE_IDENTITY:
+        query = []
+        for item in MAP_IDENTITY:
             query.append(item)
 
         # Collect data
         message = compilers.nvram(query)
         try:
-            raw = await self.async_hook(message, force=True)
+            raw = await self.async_api_hook(message)
         except Exception as ex:
-            raise AsusRouterIdentityError(ERROR_IDENTITY.format(self._host, str(ex)))
+            raise AsusRouterIdentityError(
+                ERROR_IDENTITY.format(self._host, str(ex))
+            ) from ex
 
         # Parse
-        identity = dict()
-        for item in AR_DEVICE_IDENTITY:
+        identity = {}
+        for item in MAP_IDENTITY:
             key = item.get()
             try:
                 data = item.method(raw[item.value]) if item.method else raw[item.value]
                 if key in identity:
-                    if type(identity[key]) is list:
+                    if isinstance(identity[key], list):
                         identity[key].extend(data)
                     else:
                         identity[key] = data
@@ -220,7 +319,17 @@ class AsusRouter:
             except Exception as ex:
                 raise AsusRouterIdentityError(
                     ERROR_IDENTITY.format(self._host, str(ex))
-                )
+                ) from ex
+
+        # Mac (for some Merlin devices missing label_mac)
+        if identity["mac"] is None or identity["mac"] == str():
+            if identity["lan_mac"] is not None:
+                identity["mac"] = identity["lan_mac"]
+            elif identity["wan_mac"] is not None:
+                identity["mac"] = identity["wan_mac"]
+
+        identity.pop("lan_mac")
+        identity.pop("wan_mac")
 
         # Firmware
         identity["firmware"] = parsers.firmware_string(
@@ -230,640 +339,955 @@ class AsusRouter:
         identity.pop("fw_minor")
         identity.pop("fw_build")
 
+        identity[ENDPOINTS] = {}
+
         # Check by page
-        identity["sysinfo"] = await self.async_check_endpoint(
-            endpoint=AR_PATH["sysinfo"]
-        )
-        identity["onboarding"] = await self.async_check_endpoint(
-            endpoint=AR_PATH["onboarding"]
-        )
-        identity["update_networkmapd"] = await self.async_check_endpoint(
-            endpoint=AR_PATH["networkmap"]
-        )
-
-        # Check RGBG / AURA
-        try:
-            data = await self.connection.async_load(AR_PATH["rgb"])
-            if AR_KEY_AURARGB in data:
-                identity["aura"] = True
-            elif AR_KEY_LEDG_COUNT in data:
-                identity["ledg"] = True
-                self._ledg_count = parsers.ledg_count(data)
-        except AsusRouter404 as ex:
-            """Do nothing"""
-
-        # Check VPN
-        try:
-            data = await self.connection.async_load(AR_PATH["vpn"])
-            identity["vpn_status"] = True
-        except AsusRouter404 as ex:
-            """Do nothing"""
+        for endpoint, address in ENDPOINT.items():
+            self.monitor[endpoint].enabled = identity[ENDPOINTS][
+                endpoint
+            ] = await self.async_check_endpoint(address)
 
         # Save static values
-        self._status_led = raw[AR_KEY_LED]
+        self._state_led = raw[LED_VAL]
 
+        # Define usable endpoints
+        if identity["firmware"].minor == 380:
+            self._endpoint_devices = DEVICES
+
+        # Save identity
         self._identity = AsusDevice(**identity)
 
-        _LOGGER.debug(MSG_SUCCESS["identity"])
+        _LOGGER.debug("Identity collected")
 
-    ### <-- MAIN CONTROL
+    # <-- MAIN CONTROL
 
-    ### DATA PROCESSING -->
+    # API COMMUNICATIONS -->
 
-    async def async_command(
+    async def async_api_command(
         self,
         commands: dict[str, str] | None = None,
-        action_mode: str = DEFAULT_ACTION_MODE,
-        apply_to: str = AR_PATH["command"],
+        endpoint: str = ENDPOINT[COMMAND],
     ) -> dict[str, Any]:
-        """Command device to run a service or set parameter"""
+        """Send a command to API"""
 
-        result = {}
+        return await self.async_api_load(endpoint=endpoint, command=str(commands))
 
-        if not self._enable_control:
-            _LOGGER.error(MSG_ERROR["disabled_control"])
-            return result
+    async def async_api_hook(self, hook: str | None = None) -> dict[str, Any]:
+        """Hook data from API"""
 
-        request: dict = {
-            KEY_ACTION_MODE: action_mode,
-        }
-        if commands is not None:
-            for command in commands:
-                request[command] = commands[command]
+        return await self.async_api_load(
+            endpoint=ENDPOINT[HOOK],
+            command=f"{HOOK}={hook}",
+        )
 
+    async def async_api_load(
+        self,
+        endpoint: str | None = None,
+        command: str = "",
+    ) -> dict[str, Any]:
+        """Load API endpoint"""
+
+        # Endpoint should be selected
+        if endpoint is None:
+            _LOGGER.debug("No endpoint selected")
+            return {}
+
+        # Process endpoint
         try:
             result = await self.connection.async_run_command(
-                command=str(request), endpoint=apply_to
+                command=command, endpoint=endpoint
             )
-        except Exception as ex:
-            raise ex
-
-        return result
-
-    async def async_hook(
-        self, hook: str | None = None, force: bool = False
-    ) -> dict[str, Any]:
-        """Hook data from device"""
-
-        result = {}
-
-        if not self._enable_monitor and not force:
-            _LOGGER.error(MSG_ERROR["disabled_monitor"])
-            return result
-
-        if hook is None:
-            _LOGGER.debug(MSG_INFO["empty_request"])
-            return result
-
-        try:
-            result = await self.connection.async_run_command(
-                command="{}={}".format(KEY_HOOK, hook)
-            )
-        except Exception as ex:
-            raise ex
-
-        # Check for errors during hook
-        if self.connection.error:
-            _LOGGER.debug(MSG_INFO["error_flag"])
-            await self.async_handle_error()
-
-        return result
-
-    async def async_load(self, page: str | None = None) -> dict[str, Any]:
-        """Return the data from the page"""
-
-        result = {}
-
-        if not self._enable_monitor:
-            _LOGGER.error(MSG_ERROR["disabled_monitor"])
-            return result
-
-        if page is None:
-            _LOGGER.debug(MSG_INFO["empty_request"])
-            return result
-
-        try:
-            result = await self.connection.async_run_command(command="", endpoint=page)
+        # HTTP 404 should be processed separately
         except AsusRouter404 as ex:
-            raise ex
+            raise AsusRouter404 from ex
         except Exception as ex:
             raise ex
 
+        # Check for errors during API call
+        if self.connection.error:
+            _LOGGER.debug("Error flag found. Fixing")
+            await self._async_handle_error()
+
         return result
 
-    ### <-- DATA PROCESSING
+    # <-- API COMMUNICATIONS
 
-    ### MONITORS -->
+    # MONITORS -->
 
-    async def async_monitor_main(self) -> None:
-        """Get all the main monitor values. Non-cacheable"""
+    async def async_monitor(self, endpoint: str) -> None:
+        """Monitor an endpoint"""
 
-        while self._monitor_main.active:
-            await asyncio.sleep(DEFAULT_SLEEP_TIME)
+        # Check flags before monitoring for new data
+        await self._check_flags()
+
+        # Check whether to run
+        if not await self.async_monitor_should_run(endpoint):
             return
 
+        process: Callable[[str], dict[str, Any]] = self.monitor_method.get(endpoint)
+
         try:
-            self._monitor_main.start()
+            # Start
+            self.monitor[endpoint].start()
+            monitor = Monitor()
+            # Hook data
+            raw = await self.async_api_load(
+                compilers.endpoint(endpoint, self._identity),
+                command=self.monitor_arg.get(endpoint, str()),
+            )
+            # Reset time
+            monitor.reset()
 
-            monitor_main = Monitor()
+            # Process data
 
-            hook = compilers.hook(MONITOR_MAIN)
-            data = await self.async_hook(hook)
+            result = process(raw, time=monitor.time)
+            for key, data in result.items():
+                monitor[key] = data
 
-            monitor_main.reset()
+            # Finish and save data
+            monitor.finish()
+            self.monitor[endpoint] = monitor
 
-            ### CPU ###
-            ## Not yet known what exactly is type of data. But this is the correct way to calculate usage from it
+        except AsusRouterError as ex:
+            self.monitor[endpoint].drop()
+            raise ex
 
-            # Keep safe
-            if AR_KEY_CPU in data:
+        return
 
-                raw_cpu = data[AR_KEY_CPU]
+    async def async_monitor_available(self, monitor: str) -> bool:
+        """Check whether monitor is available"""
 
-                # Check which cores CPU has or find it out and save for later
-                if self._device_cpu_cores is None:
-                    self._device_cpu_cores = parsers.cpu_cores(raw=raw_cpu)
+        # Monitor does not exist
+        if monitor not in self.monitor:
+            _LOGGER.debug("Monitor `%s` does not exist", monitor)
+            return False
 
-                # Traffic data from the device
-                monitor_main[KEY_CPU] = parsers.cpu_usage(
-                    raw=raw_cpu, cores=self._device_cpu_cores
-                )
+        # Monitor is disabled
+        if not self.monitor[monitor].enabled:
+            _LOGGER.debug("Monitor `%s` is disabled", monitor)
+            return False
 
-                # Calculate actual usage in percents and save it. Only if there was old data for CPU
-                if self._monitor_main.ready and KEY_CPU in self._monitor_main:
-                    for item in monitor_main[KEY_CPU]:
-                        if item in self._monitor_main[KEY_CPU]:
-                            monitor_main[KEY_CPU][item] = calculators.usage_in_dict(
-                                after=monitor_main[KEY_CPU][item],
-                                before=self._monitor_main[KEY_CPU][item],
-                            )
+        _LOGGER.debug("Monitor `%s` is enabled", monitor)
+        return True
 
-            # Keep last data
-            elif self._monitor_main.ready and KEY_CPU in self._monitor_main:
-                monitor_main[KEY_CPU] = self._monitor_main[KEY_CPU]
+    async def async_monitor_cached(self, monitor: str, value: Any) -> bool:
+        """Check whether monitor has cached value"""
 
-            ### RAM ###
-            ## Data is in KiB. To get MB as they are shown in the device Web-GUI, should be devided by 1024 (yes, those will be MiB)
+        now = datetime.utcnow()
+        if (
+            not self.monitor[monitor].ready
+            or value not in self.monitor[monitor]
+            or self._cache_time < (now - self.monitor[monitor].time).total_seconds()
+        ):
+            _LOGGER.debug(
+                "Value `%s` is not in cache yet by monitor `%s` "
+                "or the caching time has already expired",
+                value,
+                monitor,
+            )
+            return False
 
-            if AR_KEY_RAM in data:
-                # Populate RAM with known values
-                monitor_main[KEY_RAM] = parsers.ram_usage(raw=data[AR_KEY_RAM])
+        _LOGGER.debug(
+            "Value `%s` is already cached by monitor `%s`. Using cache", value, monitor
+        )
+        return True
 
-                # Calculate usage in percents
+    async def async_monitor_ready(self, monitor: str, retry=False) -> bool:
+        """Get monitor ready to run"""
+
+        if not self.monitor[monitor].ready:
+            requirement = MONITOR_REQUIRE_CONST.get(monitor)
+            if requirement:
+                value = self.constant.get(requirement)
+                if value:
+                    _LOGGER.debug(
+                        "Required constant found. Trying to compile monitor `%s`",
+                        monitor,
+                    )
+                    self.monitor_compile[monitor](value)
+                    return True
+                if not retry and requirement in CONST_REQUIRE_MONITOR:
+                    _LOGGER.debug(
+                        "Monitor `%s` requires constant `%s` to be found first. "
+                        "Initializing corresponding monitor",
+                        monitor,
+                        requirement,
+                    )
+                    await self.async_monitor(CONST_REQUIRE_MONITOR[requirement])
+                    return await self.async_monitor_ready(monitor, retry=True)
+                return False
+            return False
+        return True
+
+    async def async_monitor_should_run(self, monitor: str) -> bool:
+        """Check whether monitor should be run"""
+
+        # Monitor is not available
+        if not await self.async_monitor_available(monitor):
+            return False
+
+        # Monitor not ready
+        if not await self.async_monitor_ready(monitor):
+            return False
+
+        # Monitor is already running - wait to complete
+        if self.monitor[monitor].active:
+            while self.monitor[monitor].active:
+                await asyncio.sleep(DEFAULT_SLEEP_TIME)
+            return False
+
+        return True
+
+    # COMPILE MONITORS
+
+    def _compile_monitor_nvram(self, wlan: list[str]) -> None:
+        """Compile `nvram` monitor"""
+
+        _LOGGER.debug("Compiling monitor NVRAM")
+
+        arg = compilers.monitor_arg_nvram(wlan)
+        if arg:
+            self.monitor_arg[NVRAM] = f"hook={arg}"
+        self.monitor[NVRAM].ready = True
+
+        _LOGGER.debug("Monitor NVRAM was compiled")
+
+    # PROCESS MONITORS
+
+    def _process_monitor_devicemap(self, raw: Any, time: datetime) -> dict[str, Any]:
+        """Process data from `devicemap` endpoint"""
+
+        # Devicemap
+        devicemap = raw
+
+        # Boot time
+        boottime = {}
+        # Since precision is 1 second, could be that old and new are 1 sec different.
+        # In this case, we should not change the boot time,
+        # but keep the previous value to avoid regular changes
+        if SYS in devicemap and "uptimeStr" in devicemap[SYS]:
+            time = parsers.uptime(devicemap[SYS]["uptimeStr"])
+            timestamp = int(time.timestamp())
+
+            boottime[TIMESTAMP] = timestamp
+            boottime[ISO] = time.isoformat()
+
+            # If previous boot time exists
+            if BOOTTIME in self.monitor[DEVICEMAP]:
+                _timestamp = self.monitor[DEVICEMAP][BOOTTIME][TIMESTAMP]
+                _time = datetime.fromtimestamp(_timestamp)
+                # Leave the same boot time, since we don't know the new correct time
                 if (
-                    DATA_USED in monitor_main[KEY_RAM]
-                    and DATA_TOTAL in monitor_main[KEY_RAM]
+                    time == _time
+                    or abs(timestamp - _timestamp) < 2
+                    or timestamp - _timestamp < 0
                 ):
-                    monitor_main[KEY_RAM] = calculators.usage_in_dict(
-                        after=monitor_main[KEY_RAM]
-                    )
-            # Keep last data
-            elif self._monitor_main.ready and KEY_RAM in self._monitor_main:
-                monitor_main[KEY_RAM] = self._monitor_main[KEY_RAM]
-
-            ### NETWORK ###
-            ## Data in Bytes for traffic and bits/s for speeds
-
-            if AR_KEY_NETWORK in data:
-                # Calculate RX and TX from the HEX values. If there is no current value, but there was one before, get it from storage. Traffic resets only on device reboot or when above the limit. Device disconnect / reconnect does NOT reset it
-                monitor_main[KEY_NETWORK] = parsers.network_usage(
-                    raw=data[AR_KEY_NETWORK]
-                )
-
-                if self._monitor_main.ready and KEY_NETWORK in self._monitor_main:
-                    # Calculate speeds
-                    time_delta = (
-                        monitor_main.time - self._monitor_main.time
-                    ).total_seconds()
-                    monitor_main[KEY_NETWORK] = parsers.network_speed(
-                        after=monitor_main[KEY_NETWORK],
-                        before=self._monitor_main[KEY_NETWORK],
-                        time_delta=time_delta,
-                    )
-
-            # Keep last data
-            elif self._monitor_main.ready and KEY_NETWORK in self._monitor_main:
-                monitor_main[KEY_NETWORK] = self._monitor_main[KEY_NETWORK]
-
-            ### WAN STATE ###
-
-            if AR_KEY_WAN in data:
-                # Populate WAN with known values
-                monitor_main[KEY_WAN] = parsers.wan_state(raw=data[AR_KEY_WAN])
-
-            # Keep last data
-            elif self._monitor_main.ready and KEY_WAN in self._monitor_main:
-                monitor_main[KEY_WAN] = self._monitor_main[KEY_WAN]
-
-            ### SYSINFO ###
-
-            if self._identity:
-                if self._identity.sysinfo:
-                    monitor_main[KEY_SYSINFO] = await self.async_load(
-                        page=AR_PATH["sysinfo"]
-                    )
-
-            monitor_main.finish()
-            self._monitor_main = monitor_main
-        except AsusRouterError as ex:
-            self._monitor_main.drop()
-            raise ex
-
-        return
-
-    async def async_monitor_nvram(self, groups: list[str] | str | None = None) -> None:
-        """Get the NVRAM values for the specified group list"""
-
-        while self._monitor_nvram.active:
-            await asyncio.sleep(DEFAULT_SLEEP_TIME)
-            return
-
-        try:
-            self._monitor_nvram.start()
-
-            monitor_nvram = Monitor()
-
-            # If none groups were sent, will return all the known NVRAM values
-            if groups is None:
-                groups = [*NVRAM_LIST]
-
-            # If only one group is sent
-            if type(groups) is not list:
-                groups = [groups.upper()]
-
-            requests = []
-            for group in groups:
-                group = group.upper()
-                if group in NVRAM_LIST:
-                    for value in NVRAM_LIST[group]:
-                        requests.append(value)
+                    boottime = self.monitor[DEVICEMAP][BOOTTIME]
+                # Boot time changed -> there was reboot
                 else:
-                    _LOGGER.warning(
-                        "There is no {} in known NVRAM groups".format(group)
+                    boottime[TIMESTAMP] = timestamp
+                    boottime[ISO] = time.isoformat()
+                    # Mark reboot
+                    self._mark_reboot()
+
+        # VPN
+        vpn = {}
+        vpnmap = devicemap.get(VPN)
+        if vpnmap:
+            for num in RANGE_OVPN_CLIENTS:
+                key = f"{VPN_CLIENT}{num}"
+                vpn[key] = {}
+                if f"{key}_{STATE}" in vpnmap:
+                    status = converters.int_from_str(vpnmap[f"{key}_{STATE}"])
+                    vpn[key][STATE] = status > 0
+                    vpn[key][STATUS] = MAP_OVPN_STATUS.get(
+                        status, f"{UNKNOWN} ({status})"
                     )
+                if f"{key}_{ERRNO}" in vpnmap:
+                    vpn[key][ERRNO] = converters.int_from_str(vpnmap[f"{key}_{ERRNO}"])
 
-            message = compilers.nvram(requests)
-            result = await self.async_hook(message)
+        return {
+            DEVICEMAP: devicemap,
+            BOOTTIME: boottime,
+            VPN: vpn,
+        }
 
-            monitor_nvram.reset()
+    def _process_monitor_devices(self, raw: Any, time: datetime) -> dict[str, Any]:
+        """Process data from `devices` endpoint"""
 
-            for item in result:
-                monitor_nvram[item] = result[item]
+        # Clients
+        clients = {}
+        if "get_clientlist" in raw:
+            data = raw["get_clientlist"]
+            for mac, description in data.items():
+                if converters.is_mac_address(mac):
+                    clients[mac] = description
 
-            monitor_nvram.finish()
-            self._monitor_nvram = monitor_nvram
-        except AsusRouterError as ex:
-            self._monitor_nvram.drop()
-            raise ex
+        return {
+            CLIENTS: clients,
+        }
 
-        return
+    def _process_monitor_ethernet_ports(
+        self, raw: Any, time: datetime
+    ) -> dict[str, Any]:
+        """Process data from `ethernet ports` endpoint"""
 
-    async def async_monitor_misc(self) -> None:
-        """Get all other useful values"""
+        # Ports info
+        ports = {
+            LAN: {},
+            WAN: {},
+        }
+        if "portSpeed" in raw:
+            data = raw["portSpeed"]
+            for port in data:
+                port_type = port[0:3].lower()
+                port_id = converters.int_from_str(port[3:])
+                value = SPEED_TYPES.get(data[port])
+                ports[port_type][port_id] = {
+                    STATE: converters.bool_from_any(value),
+                    LINK_RATE: value,
+                }
 
-        while self._monitor_misc.active:
-            await asyncio.sleep(DEFAULT_SLEEP_TIME)
-            return
+        return {
+            PORTS: ports,
+        }
 
-        try:
-            self._monitor_misc.start()
+    def _process_monitor_firmware(self, raw: Any, time: datetime) -> dict[str, Any]:
+        """Process data from `firmware` endpoint"""
 
-            monitor_misc = Monitor()
+        # Firmware
+        firmware = raw
+        fw_current = self._identity.firmware
+        fw_new = parsers.firmware_string(raw["webs_state_info"]) or fw_current
 
-            ### PORTS
+        firmware[STATE] = fw_current < fw_new
+        firmware["current"] = str(fw_current)
+        firmware["available"] = str(fw_new)
 
-            # Receive ports number and status (disconnected, 100 Mb/s, 1 Gb/s)
-            data = await self.async_load(page=AR_PATH["ports"])
+        return {
+            FIRMWARE: firmware,
+        }
 
-            monitor_misc.reset()
+    def _process_monitor_light(self, raw: Any, time: datetime) -> dict[str, Any]:
+        """Process data from `light` endpoint"""
 
-            monitor_misc["PORTS"] = dict()
-            if "portSpeed" in data:
-                for type in PORT_TYPE:
-                    monitor_misc["PORTS"][type] = dict()
-                for value in data["portSpeed"]:
-                    for type in PORT_TYPE:
-                        if type in value:
-                            number = value.replace(type, "")
-                            monitor_misc["PORTS"][type][number] = parsers.port_speed(
-                                data["portSpeed"][value]
+        # LED
+        led = {}
+        if LED_VAL in raw:
+            led[STATE] = converters.bool_from_any(raw[LED_VAL])
+            self._state_led = led[STATE]
+
+        return {
+            LED: led,
+        }
+
+    def _process_monitor_main(self, raw: Any, time: datetime) -> dict[str, Any]:
+        """Process data from `main` endpoint"""
+
+        # CPU
+        cpu = {}
+        if CPU_USAGE in raw:
+
+            cpu = parsers.cpu_usage(raw=raw[CPU_USAGE])
+
+            # Calculate actual usage in percents and save it. Only if there was old data for CPU
+            if self.monitor[MAIN].ready and CPU in self.monitor[MAIN]:
+                for item in cpu:
+                    if item in self.monitor[MAIN][CPU]:
+                        cpu[item] = calculators.usage_in_dict(
+                            after=cpu[item],
+                            before=self.monitor[MAIN][CPU][item],
+                        )
+        # Keep last data
+        elif self.monitor[MAIN].ready and CPU in self.monitor[MAIN]:
+            cpu = self.monitor[MAIN][CPU]
+
+        # RAM
+        ram = {}
+        # Data is in KiB. To get MB as they are shown in the device Web-GUI,
+        # should be devided by 1024 (yes, those will be MiB)
+        if MEMORY_USAGE in raw:
+            # Populate RAM with known values
+            ram = parsers.ram_usage(raw=raw[MEMORY_USAGE])
+
+            # Calculate usage in percents
+            if USED in ram and TOTAL in ram:
+                ram = calculators.usage_in_dict(after=ram)
+        # Keep last data
+        elif self.monitor[MAIN].ready and RAM in self.monitor[MAIN]:
+            ram = self.monitor[MAIN][RAM]
+
+        # Network
+        network = {}
+        # Data in Bytes for traffic and bits/s for speeds
+        if NETDEV in raw:
+            # Calculate RX and TX from the HEX values.
+            # If there is no current value, but there was one before, get it from storage.
+            # Traffic resets only on device reboot or when above the limit.
+            # Device disconnect / reconnect does NOT reset it
+            network = parsers.network_usage(raw=raw[NETDEV])
+
+            if self.monitor[MAIN].ready and NETWORK in self.monitor[MAIN]:
+                # Calculate speeds
+                time_delta = (time - self.monitor[MAIN].time).total_seconds()
+                network = parsers.network_speed(
+                    after=network,
+                    before=self.monitor[MAIN][NETWORK],
+                    time_delta=time_delta,
+                )
+        # Keep last data
+        elif self.monitor[MAIN].ready and NETWORK in self.monitor[MAIN]:
+            network = self.monitor[MAIN][NETWORK]
+
+        if USB not in network and "dualwan" in self._identity.services:
+            network[USB] = {}
+        # Save constant
+        constant = []
+        for interface in network:
+            if interface in WLAN_TYPE:
+                constant.append(interface)
+        self._init_constant(WLAN, constant)
+
+        # WAN
+        wan = {}
+        if WANLINK_STATE in raw:
+            # Populate WAN with known values
+            wan = parsers.wan_state(raw=raw[WANLINK_STATE])
+        # Keep last data
+        elif self.monitor[MAIN].ready and WAN in self.monitor[MAIN]:
+            wan = self.monitor[MAIN][WAN]
+
+        return {
+            CPU: cpu,
+            NETWORK: network,
+            RAM: ram,
+            WAN: wan,
+        }
+
+    def _process_monitor_nvram(self, raw: Any, time: datetime) -> dict[str, Any]:
+        """Process data from `nvram` endpoint"""
+
+        # Check whether data was received before trying to parse it
+        if not raw:
+            return {
+                GWLAN: {},
+                WLAN: {},
+            }
+
+        # WLAN
+        wlan = {}
+        dictionary = MAP_NVRAM.get(WLAN)
+        if dictionary:
+            for intf in self.constant[WLAN]:
+                interface = WLAN_TYPE.get(intf)
+                if interface is not None:
+                    wlan[intf] = {}
+                    for key in dictionary:
+                        key_to_use = (key.value.format(interface))[4:]
+                        wlan[intf][key_to_use] = key.method(
+                            raw[key.value.format(interface)]
+                        )
+
+        # GWLAN
+        gwlan = {}
+        dictionary = MAP_NVRAM.get(GWLAN)
+        if dictionary:
+            for intf in self.constant[WLAN]:
+                interface = WLAN_TYPE.get(intf)
+                if interface is not None:
+                    for gid in RANGE_GWLAN:
+                        gwlan[f"{intf}_{gid}"] = {}
+                        for key in dictionary:
+                            key_to_use = (key.value.format(interface))[4:]
+                            gwlan[f"{intf}_{gid}"][key_to_use] = key.method(
+                                raw[key.value.format(f"{interface}.{gid}")]
                             )
-                            break
 
-            ### TEMPERATURES ###
-            monitor_misc[KEY_TEMPERATURE] = await self.async_load(
-                page=AR_PATH["temperature"]
+        return {
+            GWLAN: gwlan,
+            WLAN: wlan,
+        }
+
+    def _process_monitor_onboarding(self, raw: Any, time: datetime) -> dict[str, Any]:
+        """Process data from `onboarding` endpoint"""
+
+        # AiMesh nodes state
+        aimesh = {}
+        data = raw["get_cfg_clientlist"][0]
+        for device in data:
+            node = parsers.aimesh_node(device)
+            aimesh[node.mac] = node
+
+        # Client list
+        clients = {}
+        data = raw["get_allclientlist"][0]
+        for node in data:
+            for connection in data[node]:
+                for mac in data[node][connection]:
+                    convert = converters.onboarding_connection(connection)
+                    description = {
+                        CONNECTION_TYPE: convert[CONNECTION_TYPE],
+                        GUEST: convert[GUEST],
+                        IP: converters.none_or_str(
+                            data[node][connection][mac].get(IP, None)
+                        ),
+                        MAC: mac,
+                        NODE: node,
+                        ONLINE: True,
+                        RSSI: data[node][connection][mac].get(RSSI, None),
+                    }
+                    clients[mac] = description
+
+        return {
+            AIMESH: aimesh,
+            CLIENTS: clients,
+        }
+
+    def _process_monitor_parental_control(
+        self, raw: Any, time: datetime
+    ) -> dict[str, Any]:
+        """Process data from `parental control` endpoint"""
+
+        parental_control = {}
+
+        # State
+        parental_control[STATE] = None
+        if KEY_PARENTAL_CONTROL_STATE in raw:
+            parental_control[STATE] = converters.bool_from_any(
+                raw[KEY_PARENTAL_CONTROL_STATE]
             )
 
-            # Load devicemap
-            data = await self.async_load(page=AR_PATH["devicemap"])
-            monitor_misc["DEVICEMAP"] = data
+        # Rules
+        rules = {}
 
-            ### VPN ###
-            if self._identity.vpn_status:
-                monitor_misc[KEY_VPN] = await self.async_load(page=AR_PATH["vpn"])
-                if monitor_misc["DEVICEMAP"] and monitor_misc[KEY_VPN]:
-                    monitor_misc[KEY_VPN] = compilers.vpn_from_devicemap(
-                        monitor_misc[KEY_VPN], monitor_misc["DEVICEMAP"]
-                    )
-            else:
-                monitor_misc[KEY_VPN] = compilers.vpn_from_devicemap(
-                    None, monitor_misc["DEVICEMAP"]
+        if raw.get(KEY_PARENTAL_CONTROL_MAC) != raw.get(KEY_PARENTAL_CONTROL_TYPE):
+            as_is = {}
+            for element in MAP_PARENTAL_CONTROL_ITEM:
+                temp = raw[element.value].split(DELIMITER_PARENTAL_CONTROL_ITEM)
+                as_is[element.get()] = []
+                for temp_element in temp:
+                    as_is[element.get()].append(element.method(temp_element))
+
+            number = len(as_is[MAC])
+            for i in range(0, number):
+                rules[as_is[MAC][i]] = FilterDevice(
+                    mac=as_is[MAC][i],
+                    name=as_is[NAME][i],
+                    type=MAP_PARENTAL_CONTROL_TYPE.get(as_is[TYPE][i], UNKNOWN),
+                    timemap=as_is[TIMEMAP][i] if i < len(as_is[TIMEMAP]) else None,
                 )
 
-            # Calculate boot time. Since precision is 1 second, could be that old and new are 1 sec different. In this case, we should not change the boot time, but keep the previous value to avoid regular changes
-            if "SYS" in monitor_misc["DEVICEMAP"]:
-                if "uptimeStr" in monitor_misc["DEVICEMAP"]["SYS"]:
-                    time = parsers.uptime(monitor_misc["DEVICEMAP"]["SYS"]["uptimeStr"])
-                    timestamp = int(time.timestamp())
-                    if not "BOOTTIME" in monitor_misc:
-                        monitor_misc["BOOTTIME"] = dict()
+        parental_control[RULES] = rules.copy()
 
-                    if "BOOTTIME" in self._monitor_misc:
-                        _timestamp = self._monitor_misc["BOOTTIME"]["timestamp"]
-                        _time = datetime.fromtimestamp(_timestamp)
-                        if time == _time or abs(timestamp - _timestamp) < 2:
-                            monitor_misc["BOOTTIME"] = self._monitor_misc["BOOTTIME"]
-                        # This happens on reboots if data is checked before the device got correct time from NTP
-                        elif timestamp - _timestamp < 0:
-                            # Leave the same boot time, since we don't know the new correct time
-                            monitor_misc["BOOTTIME"] = self._monitor_misc["BOOTTIME"]
-                        # Boot time changed -> there was reboot
-                        else:
-                            monitor_misc["BOOTTIME"]["timestamp"] = timestamp
-                            monitor_misc["BOOTTIME"]["ISO"] = time.isoformat()
-                            await self.async_handle_reboot()
-                    else:
-                        monitor_misc["BOOTTIME"]["timestamp"] = timestamp
-                        monitor_misc["BOOTTIME"]["ISO"] = time.isoformat()
+        return {PARENTAL_CONTROL: parental_control}
 
-                    if self._device_boottime != monitor_misc["BOOTTIME"]["ISO"]:
-                        self._device_boottime = monitor_misc["BOOTTIME"]["ISO"]
+    def _process_monitor_port_status(self, raw: Any, time: datetime) -> dict[str, Any]:
+        """Process data from `port status` endpoint"""
 
-            monitor_misc.finish()
-            self._monitor_misc = monitor_misc
-        except AsusRouterError as ex:
-            self._monitor_misc.drop()
-            raise ex
+        # Ports info
+        ports = {
+            LAN: {},
+            USB: {},
+            WAN: {},
+        }
+        if f"{PORT}_{INFO}" in raw:
+            data = raw[f"{PORT}_{INFO}"][self._identity.mac]
+            for port in data:
+                port_type = PORT_TYPES.get(port[0])
+                port_id = converters.int_from_str(port[1:])
+                # Replace needed key/value pairs
+                for key in CONVERTERS[PORT_STATUS]:
+                    if key.value in data[port]:
+                        data[port][key.get()] = key.method(data[port][key.value])
+                        if key.get() != key.value:
+                            data[port].pop(key.value)
+                # Temporary solution for USB
+                if port_type == USB and DEVICES in data[port]:
+                    data[port][STATE] = True
+                ports[port_type][port_id] = data[port]
+        elif self.monitor[PORT_STATUS].ready and PORTS in self.monitor[PORT_STATUS]:
+            ports = self.monitor[PORT_STATUS][PORTS]
 
-        return
+        return {
+            PORTS: ports,
+        }
 
-    async def async_monitor_devices(self) -> None:
-        """Monitor connected devices"""
+    def _process_monitor_port_forwarding(
+        self, raw: Any, time: datetime
+    ) -> dict[str, Any]:
+        """Process data from `port forwarding` endpoint"""
 
-        while self._monitor_devices.active:
-            await asyncio.sleep(DEFAULT_SLEEP_TIME)
-            return
+        port_forwarding = {}
 
-        try:
-            self._monitor_devices.start()
-            monitor_devices = Monitor()
+        # State
+        port_forwarding[STATE] = None
+        if KEY_PORT_FORWARDING_STATE in raw:
+            port_forwarding[STATE] = converters.bool_from_any(
+                raw[KEY_PORT_FORWARDING_STATE]
+            )
 
-            # Update device list (needed for older devices)
-            await self.async_check_endpoint(AR_PATH["devices_update"])
-            if self._identity.update_networkmapd:
-                await self.async_check_endpoint(AR_PATH["networkmap"])
-            data = await self.async_hook(AR_HOOK_DEVICES)
+        # Rules
+        if KEY_PORT_FORWARDING_LIST in raw:
+            rules = []
+            data = raw[KEY_PORT_FORWARDING_LIST]
+            rule_list = data.split("&#60")
+            for rule in rule_list:
+                if rule == str():
+                    continue
+                part = rule.split("&#62")
+                rules.append(
+                    PortForwarding(
+                        name=converters.none_or_any(part[0]),
+                        ip=part[2],
+                        port=converters.none_or_any(part[3]),
+                        protocol=part[4],
+                        ip_external=converters.none_or_any(part[5]),
+                        port_external=part[1],
+                    )
+                )
+            port_forwarding[RULES] = rules.copy()
 
-            monitor_devices.reset()
+        return {
+            PORT_FORWARDING: port_forwarding,
+        }
 
-            # Search for new data
-            if AR_KEY_DEVICES in data:
-                data = data[AR_KEY_DEVICES]
-                for mac in data:
-                    if converters.is_mac_address(mac):
-                        monitor_devices[mac] = parsers.connected_device(data[mac])
-            # Or keep last data
-            elif self._monitor_devices.ready:
-                monitor_devices = self._monitor_devices
+    def _process_monitor_sysinfo(self, raw: Any, time: datetime) -> dict[str, Any]:
+        """Process data from `sysinfo` endpoint"""
 
-            monitor_devices.finish()
-            self._monitor_devices = monitor_devices
-        except AsusRouterError as ex:
-            self._monitor_devices.drop()
-            raise ex
+        # Sysinfo
+        sysinfo = raw
 
-        return
+        return {
+            SYSINFO: sysinfo,
+        }
 
-    ### <-- MONITORS
+    def _process_monitor_temperature(self, raw: Any, time: datetime) -> dict[str, Any]:
+        """Process data from `temperature` endpoint"""
 
-    async def async_handle_error(self) -> None:
-        """Actions to be taken on connection errors"""
+        # Temperature
+        temperature = raw
 
-        # Clear main monitor to prevent calculation errors in it
-        if self._monitor_main.ready:
-            self._monitor_main = Monitor()
+        return {
+            TEMPERATURE: temperature,
+        }
 
-        # Clear error
+    def _process_monitor_update_clients(
+        self, raw: Any, time: datetime
+    ) -> dict[str, Any]:
+        """Process data from `update_clients` endpoint"""
+
+        # Clients
+        clients_historic = {}
+        if "nmpClient" in raw:
+            data = raw["nmpClient"][0]
+            for mac, description in data.items():
+                if converters.is_mac_address(mac):
+                    clients_historic[mac] = description
+
+        clients = {}
+        if "fromNetworkmapd" in raw:
+            data = raw["fromNetworkmapd"][0]
+            for mac, description in data.items():
+                if converters.is_mac_address(mac):
+                    clients[mac] = description
+
+        return {
+            CLIENTS: clients,
+            CLIENTS_HISTORIC: clients_historic,
+        }
+
+    def _process_monitor_vpn(self, raw: Any, time: datetime) -> dict[str, Any]:
+        """Process data from `vpn` endpoint"""
+
+        # VPN
+        vpn = raw
+
+        return {
+            VPN: vpn,
+        }
+
+    # <-- MONITORS
+
+    # TECHNICAL -->
+
+    async def _async_handle_error(self) -> None:
+        """Actions to be taken on connection error"""
+
+        # Drop history dependent monitor values
+        for (monitor, data) in HD_DATA:
+            if monitor in self.monitor and data in self.monitor[monitor]:
+                self.monitor[monitor].pop(data)
+
+        # Clear error flag
         await self.connection.async_reset_error()
 
         return
 
+    def _init_constant(self, constant: str, value: Any) -> None:
+        """Initialize constant"""
+
+        _LOGGER.debug("Initializing constant `%s`=`%s`", constant, value)
+        self.constant[constant] = value
+
+    # <-- TECHNICAL
+
     async def async_handle_reboot(self) -> None:
         """Actions to be taken on reboot"""
 
+        # Handle reboot as error
+        await self._async_handle_error()
+
+        # Recover LED state
         await self.async_keep_state_led()
+        self._flag_reboot = False
 
         return
 
-    async def async_find_interfaces(self, use_cache: bool = True) -> None:
-        """Find available interfaces/type dictionary"""
+    # PROCESS DATA -->
 
-        if not self._monitor_nvram.ready or use_cache == False:
-            await self.async_monitor_nvram()
+    def _process_data_none(self, raw: dict[str, Any]) -> dict[str, Any]:
+        """Don't process the data"""
 
-        ports = {}
+        return raw
 
-        data = self._monitor_nvram
+    def _process_data_connected_devices(
+        self, raw: dict[str, Any]
+    ) -> dict[str, ConnectedDevice]:
+        """Process data for the connected devices"""
 
-        for if_type in INTERFACE_TYPE:
-            if if_type in data:
-                values = data[if_type].split(" ")
-                for item in values:
-                    ports[item] = INTERFACE_TYPE[if_type]
+        for mac, description in raw.items():
+            for attribute, keys in MAP_CONNECTED_DEVICE.items():
+                value = None
 
-        self._device_ports = ports
+                for key in keys:
+                    if description.get(key.value):
+                        value = key.method(description[key.value])
+                        break
 
-        return
+                if value:
+                    raw[mac][attribute] = value
 
-    async def async_initialize(self):
-        """Get all the data needed at the startup"""
+            # Remove unknown attributes
+            description = {
+                attribute: value
+                for attribute, value in description.items()
+                if attribute in MAP_CONNECTED_DEVICE
+            }
 
-        await self.async_monitor_main()
-        await self.async_monitor_nvram()
-        await self.async_find_interfaces()
-        await self.async_monitor_misc()
-        await self.async_monitor_devices()
+            raw[mac] = ConnectedDevice(**description)
 
-    ### RETURN DATA -->
+        return raw
+
+    # <-- PROCESS DATA
+
+    # RETURN DATA -->
+
+    async def async_get_data(
+        self,
+        data: str,
+        monitor: str | list[str],
+        merge: Merge = Merge.ANY,
+        process: Callable[[str], dict[str, Any]] | None = None,
+        use_cache: bool = True,
+    ) -> dict[str, Any]:
+        """Return data from the first available monitor in the list"""
+
+        result = {}
+
+        # Convert to list if only one monitor is set
+        monitor = [monitor] if isinstance(monitor, str) else monitor
+
+        # Create a list of monitors
+        monitors = []
+
+        # Check if monitors are available
+        for item in monitor:
+            if await self.async_monitor_available(item):
+                monitors.append(item)
+
+                # In this mode we need only one of the monitors
+                if merge == Merge.ANY:
+                    break
+
+        # If monitor list is empty return empty dict
+        if len(monitors) == 0:
+            return {}
+
+        # Process monitors
+        for _monitor in monitors:
+
+            # Value is not cached or cache is disabled
+            if (
+                not await self.async_monitor_cached(_monitor, data)
+                or use_cache is False
+            ):
+                await self.async_monitor(_monitor)
+
+            # Receive data
+            part = self.monitor[_monitor].get(data or {})
+
+            # Update data
+            compilers.update_rec(result, part)
+
+        # Process data
+        if process:
+            result = process(result)
+
+        # Return data
+        return result
+
+    async def async_get_aimesh(self, use_cache: bool = True) -> dict[str, AiMeshDevice]:
+        """Return AiMesh map"""
+
+        return await self.async_get_data(
+            data=AIMESH, monitor=ONBOARDING, use_cache=use_cache
+        )
+
+    async def async_get_boottime(self, use_cache: bool = True) -> dict[str, Any]:
+        """Return boottime data"""
+
+        return await self.async_get_data(
+            data=BOOTTIME, monitor=DEVICEMAP, use_cache=use_cache
+        )
+
+    async def async_get_connected_devices(
+        self, use_cache: bool = True
+    ) -> dict[str, ConnectedDevice]:
+        """Return connected devices data"""
+
+        return await self.async_get_data(
+            data=CLIENTS,
+            monitor=[self._endpoint_devices, ONBOARDING],
+            merge=Merge.ALL,
+            use_cache=use_cache,
+            process=self._process_data_connected_devices,
+        )
 
     async def async_get_cpu(self, use_cache: bool = True) -> dict[str, float]:
-        """Return CPU usage"""
+        """Return CPU data"""
 
-        now = datetime.utcnow()
-        if (
-            not self._monitor_main.ready
-            or not KEY_CPU in self._monitor_main
-            or use_cache == False
-            or (
-                use_cache == True
-                and self._cache_time < (now - self._monitor_main.time).total_seconds()
-            )
-            or self._device_cpu_cores is None
-        ):
-            await self.async_monitor_main()
-
-        result = dict()
-
-        # Check if CPU was monitored
-        if not self._monitor_main.ready or not KEY_CPU in self._monitor_main:
-            return result
-
-        for core in self._device_cpu_cores:
-            if DATA_USAGE in self._monitor_main[KEY_CPU][core]:
-                result[DATA_BY_CORE.format(core)] = self._monitor_main[KEY_CPU][core][
-                    DATA_USAGE
-                ]
-        if DATA_USAGE in self._monitor_main[KEY_CPU][DATA_TOTAL]:
-            result[DATA_TOTAL] = self._monitor_main[KEY_CPU][DATA_TOTAL][DATA_USAGE]
-
-        return result
-
-    async def async_get_cpu_labels(self) -> list[str]:
-        """Return list of CPU cores"""
-
-        if self._device_cpu_cores is None:
-            await self.async_monitor_main()
-
-        result = list()
-        result.append(DATA_TOTAL)
-        for core in self._device_cpu_cores:
-            result.append(DATA_BY_CORE.format(core))
-
-        return result
+        return await self.async_get_data(data=CPU, monitor=MAIN, use_cache=use_cache)
 
     async def async_get_devicemap(self, use_cache: bool = True) -> dict[str, Any]:
-        """Return devicemap"""
+        """Return devicemap data"""
 
-        now = datetime.utcnow()
-        if (
-            not self._monitor_devices.ready
-            or use_cache == False
-            or (
-                use_cache == True
-                and self._cache_time
-                < (now - self._monitor_devices.time).total_seconds()
-            )
-        ):
-            await self.async_monitor_misc()
+        return await self.async_get_data(
+            data=DEVICEMAP, monitor=DEVICEMAP, use_cache=use_cache
+        )
 
-        return self._monitor_misc["DEVICEMAP"]
+    async def async_get_firmware(
+        self, use_cache: bool = True
+    ) -> dict[str, AiMeshDevice]:
+        """Return firmware data"""
 
-    async def async_get_devices(self, use_cache: bool = True) -> dict[str, Any]:
-        """Return device list"""
+        return await self.async_get_data(
+            data=FIRMWARE, monitor=FIRMWARE, use_cache=use_cache
+        )
 
-        now = datetime.utcnow()
-        if (
-            not self._monitor_devices.ready
-            or use_cache == False
-            or (
-                use_cache == True
-                and self._cache_time
-                < (now - self._monitor_devices.time).total_seconds()
-            )
-        ):
-            await self.async_monitor_devices()
+    async def async_get_gwlan(self, use_cache: bool = True) -> dict[str, Any]:
+        """Return GWLAN data"""
 
-        return self._monitor_devices.copy()
+        return await self.async_get_data(data=GWLAN, monitor=NVRAM, use_cache=use_cache)
 
-    async def async_get_gwlan(self) -> dict[str, Any]:
-        """Get state of guest WLAN by id"""
+    async def async_get_led(self, use_cache: bool = True) -> dict[str, Any]:
+        """Return LED data"""
 
-        ids = await self.async_get_gwlan_ids()
-
-        # NVRAM values to check
-        nvram = list()
-        for id in ids:
-            for value in NVRAM_TEMPLATE["GWLAN"]:
-                nvram.append(value.value.format(id))
-
-        try:
-            data = await self.async_hook(compilers.nvram(nvram))
-        except AsusRouterError as ex:
-            raise ex
-        for id in ids:
-            for value in NVRAM_TEMPLATE["GWLAN"]:
-                data[value.value.format(id)] = value.method(
-                    data[value.value.format(id)]
-                )
-
-        return data
-
-    async def async_get_gwlan_ids(self) -> list[int]:
-        """Return list of guest WLAN ids"""
-
-        ids = list()
-
-        wlans = await self.async_get_wlan_ids()
-
-        for wlan in wlans:
-            for i in range(1, 4):
-                ids.append(f"{wlan}.{i}")
-
-        return ids
+        return await self.async_get_data(data=LED, monitor=LIGHT, use_cache=use_cache)
 
     async def async_get_network(
         self, use_cache: bool = True
     ) -> dict[str, (int | float)]:
-        """Return traffic and speed for all interfaces"""
+        """Return network data"""
 
-        now = datetime.utcnow()
-        if (
-            not self._monitor_main.ready
-            or use_cache == False
-            or (
-                use_cache == True
-                and self._cache_time < (now - self._monitor_main.time).total_seconds()
-            )
-        ):
-            await self.async_monitor_main()
+        return await self.async_get_data(
+            data=NETWORK, monitor=MAIN, use_cache=use_cache
+        )
 
-        result = dict()
+    async def async_get_parental_control(
+        self, use_cache: bool = True
+    ) -> dict[str, (int | float)]:
+        """Return parental control data"""
 
-        # Check if network was monitored
-        if not self._monitor_main.ready or not KEY_NETWORK in self._monitor_main:
-            return result
+        return await self.async_get_data(
+            data=PARENTAL_CONTROL, monitor=PARENTAL_CONTROL, use_cache=use_cache
+        )
 
-        for interface in self._monitor_main[KEY_NETWORK]:
-            for value in self._monitor_main[KEY_NETWORK][interface]:
-                result["{}_{}".format(interface, value)] = self._monitor_main[
-                    KEY_NETWORK
-                ][interface][value]
+    async def async_get_port_forwarding(self, use_cache: bool = True) -> dict[str, Any]:
+        """Return port forwarding data"""
 
+        return await self.async_get_data(
+            data=PORT_FORWARDING, monitor=PORT_FORWARDING, use_cache=use_cache
+        )
+
+    async def async_get_ports(
+        self, use_cache: bool = True
+    ) -> dict[str, dict[str, int]]:
+        """Return ports data"""
+
+        return await self.async_get_data(
+            data=PORTS, monitor=[PORT_STATUS, ETHERNET_PORTS], use_cache=use_cache
+        )
+
+    async def async_get_ram(self, use_cache: bool = True) -> dict[str, (int | float)]:
+        """Return RAM data"""
+
+        return await self.async_get_data(data=RAM, monitor=MAIN, use_cache=use_cache)
+
+    async def async_get_sysinfo(self, use_cache: bool = True) -> dict[str, Any]:
+        """Return sysinfo data"""
+
+        return await self.async_get_data(
+            data=SYSINFO, monitor=SYSINFO, use_cache=use_cache
+        )
+
+    async def async_get_temperature(self, use_cache: bool = True) -> dict[str, Any]:
+        """Raturn temperature data"""
+
+        return await self.async_get_data(
+            data=TEMPERATURE, monitor=TEMPERATURE, use_cache=use_cache
+        )
+
+    async def async_get_vpn(self, use_cache: bool = True) -> dict[str, Any]:
+        """Return VPN data"""
+
+        return await self.async_get_data(
+            data=VPN, monitor=[DEVICEMAP, VPN], merge=Merge.ALL, use_cache=use_cache
+        )
+
+    async def async_get_wan(self, use_cache: bool = True) -> dict[str, str]:
+        """Return WAN data"""
+
+        return await self.async_get_data(data=WAN, monitor=MAIN, use_cache=use_cache)
+
+    async def async_get_wlan(self, use_cache: bool = True) -> dict[str, Any]:
+        """Return WLAN data"""
+
+        return await self.async_get_data(data=WLAN, monitor=NVRAM, use_cache=use_cache)
+
+    # <-- RETURN DATA
+
+    # APPLY -->
+
+    # LED
+    async def async_set_led(self, value: bool | int | str) -> bool:
+        """Set LED state"""
+
+        value_to_set = converters.bool_from_any(value)
+
+        service = SERVICE_SET_LED
+        arguments = {
+            LED_VAL: converters.int_from_bool(value_to_set),
+        }
+
+        result = await self.async_service_generic_apply(
+            service=service, arguments=arguments
+        )
+
+        if result:
+            self._state_led = value_to_set
         return result
 
-    async def async_get_network_labels(self) -> list[str]:
-        """Return list of network interfaces"""
-
-        if not self._monitor_main.ready:
-            await self.async_monitor_main()
-        if not self._identity:
-            await self.async_identify()
-
-        result = list()
-
-        if not KEY_NETWORK in self._monitor_main:
-            self._monitor_main.ready = False
-            return await self.async_get_network_labels()
-        for interface in self._monitor_main[KEY_NETWORK]:
-            result.append(interface)
-
-        if not "USB" in result and "dualwan" in self._identity.services:
-            result.append("USB")
-
-        return result
-
-    ### PARENTAL CONTROL -->
+    # Parental control
     async def async_apply_parental_control_rules(
         self,
         rules: dict[str, FilterDevice],
@@ -871,47 +1295,11 @@ class AsusRouter:
         """Apply parental control rules"""
 
         request = compilers.parental_control(rules)
-        request["action_mode"] = "apply"
 
-        return await self.async_service_run(
+        return await self.async_service_generic_apply(
             service="restart_firewall",
             arguments=request,
         )
-
-    async def async_get_parental_control(self) -> dict[str, Any]:
-        """Return parental control status"""
-
-        # NVRAM values to check
-        nvram = list()
-        nvram.append(AR_KEY_PARENTAL_CONTROL.value)
-        for value in AR_MAP_PARENTAL_CONTROL:
-            nvram.append(value)
-
-        data = await self.async_hook(compilers.nvram(nvram))
-        data = parsers.parental_control(data)
-
-        return data
-
-    async def async_get_parental_control_rules(
-        self,
-        macs: str | list[str] | None = None,
-    ) -> dict[str, FilterDevice]:
-        """Return parental control rules"""
-
-        pc: dict = await self.async_get_parental_control()
-        rules = pc.get("list", dict())
-
-        # Return the full list if no device specified
-        if macs is None:
-            return rules
-
-        # Return only devices of interest
-        result = dict()
-        macs = converters.as_list(macs)
-        for mac in macs:
-            if mac in rules:
-                result[mac] = rules[mac]
-        return result
 
     async def async_remove_parental_control_rules(
         self,
@@ -921,26 +1309,26 @@ class AsusRouter:
     ) -> dict[str, FilterDevice]:
         """Remove parental control rules"""
 
-        macs = list() if macs is None else converters.as_list(macs)
-        rules = list() if rules is None else converters.as_list(rules)
+        macs = [] if macs is None else converters.as_list(macs)
+        rules = [] if rules is None else converters.as_list(rules)
 
         # Get current rules
-        cr: dict = await self.async_get_parental_control_rules()
+        current_rules: dict = (await self.async_get_parental_control())[RULES]
 
         # Remove old rules for these MACs
         for mac in macs:
-            if mac in cr:
-                cr.pop(mac)
+            if mac in current_rules:
+                current_rules.pop(mac)
         for rule in rules:
-            if rule.mac in cr:
-                cr.pop(rule.mac)
+            if rule.mac in current_rules:
+                current_rules.pop(rule.mac)
 
         # Apply new rules
         if apply:
-            await self.async_apply_parental_control_rules(cr)
+            await self.async_apply_parental_control_rules(current_rules)
 
         # Return the new rules
-        return cr
+        return current_rules
 
     async def async_set_parental_control_rules(
         self,
@@ -951,301 +1339,192 @@ class AsusRouter:
         rules = converters.as_list(rules)
 
         # Remove old rules for these MACs and get the rest of the list
-        cr = await self.async_remove_parental_control_rules(rules, apply=False)
+        current_rules = await self.async_remove_parental_control_rules(
+            rules, apply=False
+        )
 
         # Add new rules
         for rule in rules:
-            cr[rule.mac] = rule
+            current_rules[rule.mac] = rule
 
         # Apply new rules
-        return await self.async_apply_parental_control_rules(cr)
+        return await self.async_apply_parental_control_rules(current_rules)
 
-    ### <-- PARENTAL CONTROL
+    # Port forwarding
+    async def async_apply_port_forwarding_rules(
+        self,
+        rules: list[PortForwarding],
+    ) -> bool:
+        """Apply port forwarding rules"""
 
-    async def async_get_ports(
-        self, use_cache: bool = True
-    ) -> dict[str, dict[str, int]]:
-        """Return WAN/LAN ports status"""
+        request = compilers.port_forwarding(rules)
 
-        now = datetime.utcnow()
-        if (
-            not self._monitor_misc.ready
-            or use_cache == False
-            or (
-                use_cache == True
-                and self._cache_time < (now - self._monitor_misc.time).total_seconds()
-            )
-        ):
-            await self.async_monitor_misc()
+        return await self.async_service_generic_apply(
+            service="restart_firewall",
+            arguments=request,
+        )
 
-        return self._monitor_misc["PORTS"]
+    async def async_remove_port_forwarding_rules(
+        self,
+        ips: str | list[str] | None = None,
+        rules: PortForwarding | list[PortForwarding] | None = None,
+        apply: bool = True,
+    ) -> list[PortForwarding]:
+        """Remove port forwarding rules"""
 
-    async def async_get_ram(self, use_cache: bool = True) -> dict[str, (int | float)]:
-        """Return RAM and its usage"""
+        ips = [] if ips is None else converters.as_list(ips)
+        rules = [] if rules is None else converters.as_list(rules)
 
-        now = datetime.utcnow()
-        if (
-            not self._monitor_main.ready
-            or use_cache == False
-            or (
-                use_cache == True
-                and self._cache_time < (now - self._monitor_main.time).total_seconds()
-            )
-        ):
-            await self.async_monitor_main()
+        # Get current rules
+        current_rules: list[PortForwarding] = (await self.async_get_port_forwarding())[
+            RULES
+        ]
 
-        result = dict()
-
-        # Check if RAM was monitored
-        if not self._monitor_main.ready or not KEY_RAM in self._monitor_main:
-            return result
-
-        for value in self._monitor_main[KEY_RAM]:
-            result[value] = self._monitor_main[KEY_RAM][value]
-
-        return result
-
-    async def async_get_ram_labels(self) -> list[str]:
-        """Return list of CPU cores"""
-
-        if not self._monitor_main.ready:
-            await self.async_monitor_main()
-
-        result = list()
-        for value in self._monitor_main[KEY_RAM]:
-            result.append(value)
-
-        return result
-
-    async def async_get_sysinfo(self, use_cache: bool = True) -> dict[str, Any]:
-        """Return sysinfo status"""
-
-        if not self._identity.sysinfo:
-            return {}
-
-        now = datetime.utcnow()
-        if (
-            not self._monitor_main.ready
-            or use_cache == False
-            or (
-                use_cache == True
-                and self._cache_time < (now - self._monitor_main.time).total_seconds()
-            )
-        ):
-            await self.async_monitor_main()
-
-        if not KEY_SYSINFO in self._monitor_main:
-            return {}
-
-        return self._monitor_main[KEY_SYSINFO]
-
-    async def async_get_temperature(self, use_cache: bool = True) -> dict[str, Any]:
-        """Raturn temperature status"""
-
-        now = datetime.utcnow()
-        if (
-            not self._monitor_misc.ready
-            or use_cache == False
-            or (
-                use_cache == True
-                and self._cache_time < (now - self._monitor_misc.time).total_seconds()
-            )
-        ):
-            await self.async_monitor_misc()
-
-        return self._monitor_misc[KEY_TEMPERATURE]
-
-    async def async_get_temperature_labels(self) -> list[str]:
-        """Return list of temperature sensors"""
-
-        if not self._monitor_misc.ready:
-            await self.async_monitor_misc()
-
-        result = list()
-        for value in self._monitor_misc[KEY_TEMPERATURE]:
-            result.append(value)
-
-        return result
-
-    async def async_get_vpn(self, use_cache: bool = True) -> dict[str, Any]:
-        """Return VPN status"""
-
-        now = datetime.utcnow()
-        if (
-            not self._monitor_misc.ready
-            or use_cache == False
-            or (
-                use_cache == True
-                and self._cache_time < (now - self._monitor_misc.time).total_seconds()
-            )
-        ):
-            await self.async_monitor_misc()
-
-        return self._monitor_misc[KEY_VPN]
-
-    async def async_get_wan(self, use_cache: bool = True) -> dict[str, str]:
-        """Return WAN and its usage"""
-
-        now = datetime.utcnow()
-        if (
-            not self._monitor_main.ready
-            or use_cache == False
-            or (
-                use_cache == True
-                and self._cache_time < (now - self._monitor_main.time).total_seconds()
-            )
-        ):
-            await self.async_monitor_main()
-
-        result = dict()
-
-        # Check if WAN was monitored
-        if not self._monitor_main.ready or not KEY_WAN in self._monitor_main:
-            return result
-
-        for value in self._monitor_main[KEY_WAN]:
-            result[value] = self._monitor_main[KEY_WAN][value]
-
-        return result
-
-    async def async_get_wlan(self) -> dict[str, Any]:
-        """Get state of WLAN by id"""
-
-        ids = await self.async_get_wlan_ids()
-
-        # NVRAM values to check
-        nvram = list()
-        for id in ids:
-            for value in NVRAM_TEMPLATE["WLAN"]:
-                nvram.append(value.value.format(id))
-
-        try:
-            data = await self.async_hook(compilers.nvram(nvram))
-        except AsusRouterError as ex:
-            raise ex
-        for id in ids:
-            for value in NVRAM_TEMPLATE["WLAN"]:
-                data[value.value.format(id)] = value.method(
-                    data[value.value.format(id)]
+        # Remove all rules for these IPs
+        for ip in ips:
+            current_rules = [rule for rule in current_rules if rule.ip != ip]
+        # Remove exact rules
+        for rule_to_find in rules:
+            current_rules = [
+                rule
+                for rule in current_rules
+                if rule.ip != rule_to_find.ip
+                or rule.port_external != rule_to_find.port_external
+                or rule.protocol != rule_to_find.protocol
+                or (
+                    rule_to_find.ip_external is not None
+                    and rule.ip_external != rule_to_find.ip_external
                 )
+                or (rule_to_find.port is not None and rule.port != rule_to_find.port)
+            ]
 
-        return data
+        # Apply new rules
+        if apply:
+            await self.async_apply_port_forwarding_rules(current_rules)
 
-    async def async_get_wlan_ids(self) -> list[int]:
-        """Return list of WLAN ids"""
+        # Return the new rules
+        return current_rules
 
-        ids = list()
+    async def async_set_port_forwarding_rules(
+        self,
+        rules: PortForwarding | list[PortForwarding],
+    ) -> bool:
+        """Set port forwarding rules"""
 
-        interfaces = await self.async_get_network_labels()
-        for value in interfaces:
-            if value[:4] == "WLAN":
-                ids.append(int(value[-1:]))
+        rules = converters.as_list(rules)
 
-        return ids
+        # Get current rules
+        current_rules: list[PortForwarding] = (await self.async_get_port_forwarding())[
+            RULES
+        ]
 
-    ### <-- RETURN DATA
+        # Add new rules
+        for rule in rules:
+            current_rules.append(rule)
 
-    ### SERVICE RUN -->
+        # Apply new rules
+        return await self.async_apply_port_forwarding_rules(current_rules)
 
-    async def async_service_run(
+    # <-- APPLY
+
+    # SERVICE -->
+
+    async def async_service_generic(
         self,
         service: str,
         arguments: dict[str, Any] | None = None,
         expect_modify: bool = True,
         drop_connection: bool = False,
     ) -> bool:
-        """Generic service to run"""
+        """Run generic service"""
 
+        # Generate commands
+        # Should include service name to run
+        # and default mode to apply changes
         commands = {
-            AR_KEY_SERVICE_COMMAND: service,
+            SERVICE_COMMAND: service,
         }
 
+        # Add arguments if any
         if arguments:
             commands.update(arguments)
 
+        # Try running the service command
         try:
-            result = await self.async_command(commands=commands)
+            result = await self.async_api_command(commands=commands)
         except AsusRouterServerDisconnectedError as ex:
-            # For services, that will block any further connections
             if drop_connection:
-                _LOGGER.debug(MSG_INFO["drop_connection_service"].format(service))
+                _LOGGER.debug(
+                    "Service `%s` requires dropping connection to the device", service
+                )
                 await self.async_drop_connection()
                 return True
-            else:
-                raise ex
+            raise ex
 
+        # Check for the run success
         if (
-            not AR_KEY_SERVICE_REPLY in result
-            or result[AR_KEY_SERVICE_REPLY] != service
-            or not AR_KEY_SERVICE_MODIFY in result
+            SERVICE_REPLY not in result
+            or result[SERVICE_REPLY] != service
+            or SERVICE_MODIFY not in result
         ):
-            raise AsusRouterServiceError(ERROR_SERVICE.format(service, result))
+            raise AsusRouterServiceError(
+                f"Something went wrong running service `{service}`."
+                f"Raw result is: {result}"
+            )
+        _LOGGER.debug(
+            "Service `%s` was run successfully with arguments`%s`. Result: %s",
+            service,
+            arguments,
+            result,
+        )
 
-        _LOGGER.debug(MSG_INFO["service"].format(service, arguments, result))
-
+        # Check whether service(s) run requires additional actions
         services = service.split(";")
         if any(service in TRACK_SERVICES_LED for service in services):
             await self.async_keep_state_led()
 
+        # Return based on the expectations
         if expect_modify:
-            return converters.bool_from_any(result[AR_KEY_SERVICE_MODIFY])
+            return converters.bool_from_any(result[SERVICE_MODIFY])
         return True
 
-    ### SERVICES -->
+    async def async_service_generic_apply(
+        self,
+        service: str,
+        arguments: dict[str, Any] | None = None,
+        expect_modify: bool = True,
+        drop_connection: bool = False,
+    ) -> bool:
+        """Run generic service with apply"""
 
-    async def async_service_control(self, target: str, mode: str) -> bool:
-        """Start / stop / (force) restart service"""
+        if not arguments:
+            arguments = {ACTION_MODE: APPLY}
+        else:
+            arguments[ACTION_MODE] = APPLY
 
-        if not target in AR_SERVICE_CONTROL or not mode in AR_SERVICE_CONTROL[target]:
-            raise AsusRouterServiceError(ERROR_SERVICE_UNKNOWN.format(target, mode))
-
-        service = AR_SERVICE_COMMAND[mode].format(target)
-
-        drop_connection = False
-        if target in AR_SERVICE_DROP_CONNECTION:
-            drop_connection = True
-
-        return await self.async_service_run(
-            service=service, drop_connection=drop_connection
+        return await self.async_service_generic(
+            service=service,
+            arguments=arguments,
+            expect_modify=expect_modify,
+            drop_connection=drop_connection,
         )
 
-    async def async_service_led_get(self) -> bool | None:
-        """Return status of the LEDs"""
+    # <-- SERVICE
 
-        key = AR_KEY_LED
-        raw = await self.async_hook(compilers.nvram(key))
-        if not converters.none_or_str(raw[key]):
-            return None
-        value = converters.bool_from_any(raw[key])
-        self._status_led = value
-        return value
-
-    async def async_service_led_set(self, value: bool | int | str) -> bool:
-        """Set status of the LEDs"""
-
-        value_to_set = converters.bool_from_any(value)
-
-        service = "start_ctrl_led"
-        arguments = {
-            AR_KEY_LED: converters.int_from_bool(value_to_set),
-        }
-        result = await self.async_service_run(service=service, arguments=arguments)
-        if result:
-            self._status_led = value_to_set
-        return result
+    # ALPHA / NOT READY -->
 
     async def async_service_ledg_get(self) -> dict[str, Any] | None:
         """Return status of RGB LEDs in LEDG scheme"""
 
-        nvram = list()
+        nvram = []
         for mode in AR_LEDG_MODE:
             nvram.append(AR_KEY_LEDG_RGB.format(mode))
         nvram.append(AR_KEY_LEDG_SCHEME)
         nvram.append(AR_KEY_LEDG_SCHEME_OLD)
 
-        data = await self.async_hook(compilers.nvram(nvram))
+        data = await self.async_api_hook(compilers.nvram(nvram))
 
-        ledg = dict()
+        ledg = {}
         if AR_KEY_LEDG_SCHEME in data and data[AR_KEY_LEDG_SCHEME] != str():
             self._ledg_mode = data[AR_KEY_LEDG_SCHEME]
             ledg[AR_KEY_LEDG_SCHEME] = self._ledg_mode
@@ -1272,7 +1551,7 @@ class AsusRouter:
         if self._ledg_count == 0:
             return False
 
-        if not mode in AR_LEDG_MODE:
+        if mode not in AR_LEDG_MODE:
             raise (AsusRouterValueError(ERROR_VALUE.format(mode)))
 
         # Check for the known state
@@ -1281,16 +1560,16 @@ class AsusRouter:
 
         colors = calculators.rgb(color)
         for num in range(1, self._ledg_count + 1):
-            if not num in colors:
+            if num not in colors:
                 if self._ledg_color and num in self._ledg_color:
                     colors[num] = self._ledg_color[num]
                 else:
-                    colors[num] = dict()
+                    colors[num] = {}
 
         color_to_set = compilers.rgb(colors)
 
-        result = await self.async_load(
-            f"{AR_PATH['ledg']}?{AR_KEY_LEDG_SCHEME}={mode}&ledg_rgb={color_to_set}"
+        result = await self.async_api_load(
+            f"{ENDPOINT[LEDG]}?{AR_KEY_LEDG_SCHEME}" f"={mode}&ledg_rgb={color_to_set}"
         )
 
         if "statusCode" in result and int(result["statusCode"]) == 200:
@@ -1298,58 +1577,27 @@ class AsusRouter:
 
         return False
 
-    async def async_service_reboot(self) -> bool:
-        """Reboot the device"""
-
-        service = "reboot"
-        await self.async_service_run(service=service, drop_connection=True)
-        return True
-
-    async def async_get_firmware_update(self) -> dict[str, Any]:
-        """Check for firmware updates"""
-
-        result = dict()
-
-        # Check for updates
-        await self.async_command(
-            commands=None,
-            action_mode=AR_FIRMWARE_CHECK_COMMAND,
-            apply_to=AR_PATH["apply"],
-        )
-        # Get available firmware data
-        data = await self.async_load(AR_PATH["firmware"])
-
-        fw_current = self._identity.firmware
-        fw_new = parsers.firmware_string(data["webs_state_info"])
-
-        result["state"] = True if fw_current < fw_new else False
-        result["current"] = str(fw_current)
-        result["available"] = str(fw_new)
-
-        return result
-
-    ### <-- SERVICES
+    # <-- ALPHA / NOT READY
 
     async def async_keep_state_led(self) -> bool:
         """Keep state of LEDs"""
 
         # Only for Merlin firmware, so sysinfo should be present
-        if self._identity.sysinfo and self.led == False:
-            await self.async_service_led_set(True)
-            await self.async_service_led_set(False)
+        if self._identity.endpoints.get(SYSINFO) and self.state_led is False:
+            await self.async_set_led(True)
+            await self.async_set_led(False)
 
     @property
     def connected(self) -> bool:
+        """Connection status"""
         return self.connection.connected
 
     @property
-    def boottime(self) -> datetime:
-        return self._device_boottime
-
-    @property
-    def led(self) -> bool:
-        return self._status_led
+    def state_led(self) -> bool:
+        """LED status"""
+        return self._state_led
 
     @property
     def ledg_count(self) -> int:
+        """LEDG status"""
         return self._ledg_count

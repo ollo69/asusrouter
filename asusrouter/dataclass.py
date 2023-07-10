@@ -4,8 +4,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Any, Callable
 
-from asusrouter.util.converters import none_or_str
+from asusrouter.util.converters import none_or_any, none_or_str
 
 DEFAULT_PARENTAL_CONTROL_TIMEMAP = "W03E21000700<W04122000800"
 
@@ -24,15 +25,16 @@ class ConnectedDevice:
     internet_mode: bool | None = None
 
     connection_type: str | None = None
+    node: str | None = None
 
     # WLAN only values
-    online: bool | None = None
+    online: bool = False
     rssi: int | None = None
     connected_since: int | None = None
     rx_speed: float | None = None
     tx_speed: float | None = None
 
-    guest: bool | None = None
+    guest: int = 0
 
 
 @dataclass
@@ -45,13 +47,38 @@ class AsusDevice:
     brand: str = "ASUSTek"
     firmware: Firmware | None = None
     services: str | None = None
-    sysinfo: bool = False
     led: bool = False
     ledg: bool = False
     aura: bool = False
     vpn_status: bool = False
-    onboarding: bool = False
-    update_networkmapd: bool = False
+    endpoints: dict[str, bool] | None = None
+
+
+@dataclass
+class AiMeshDevice:
+    """AiMesh device class"""
+
+    # Status
+    status: bool = False
+
+    alias: str | None = None
+    model: str | None = None
+    product_id: str | None = None
+    ip: str | None = None
+
+    fw: str | None = None
+    fw_new: str | None = None
+
+    mac: str | None = None
+
+    # Access point: ap2g, ap5g, ap5g1, ap6g, apdwb
+    ap: dict[str, Any] | None = None
+    # Parent AiMesh: pap2g, rssi2g, pap2g_ssid, pap5g, rssi5g, pap5g_ssid, pap6g, rssi6g, pap6g_ssid
+    parent: dict[str, Any] | None = None
+    # Node state
+    state: int | None = None
+    level: int | None = None
+    config: dict[str, Any] | None = None
 
 
 @dataclass
@@ -60,7 +87,7 @@ class Key:
 
     value: str | int
     value_to_use: str = ""
-    method: function = none_or_str
+    method: Callable = none_or_str
 
     def __str__(self) -> str:
         """Return only `value` as default"""
@@ -83,6 +110,19 @@ class Key:
 
 
 @dataclass
+class SearchKey:
+    """SearchKey class"""
+
+    value: str
+    method: Callable = none_or_any
+
+    def __str__(self) -> str:
+        """Return only `value` as default"""
+
+        return str(self.value)
+
+
+@dataclass
 class Monitor(dict):
     """
     Monitor class
@@ -95,7 +135,7 @@ class Monitor(dict):
 
     `time`: datetime object showing the last time monitor was updated
 
-    `ready`: bool flag if monitor was ever loaded
+    `ready`: bool flag if monitor is compiled
 
     Methods
     -----
@@ -110,7 +150,8 @@ class Monitor(dict):
 
     active: bool = False
     time: datetime | None = None
-    ready: bool = False
+    ready: bool = True
+    enabled: bool = True
 
     def start(self) -> None:
         """Set to active"""
@@ -148,16 +189,18 @@ class Firmware:
     build: int | None = None
     build_more: int | str | None = None
 
-    def __lt__(self, other: Firmware) -> bool:
+    def __lt__(self, other: Firmware | None) -> bool:
         """Define less-than"""
 
+        if not other:
+            return False
         if self.minor and other.minor and self.minor < other.minor:
             return True
         if self.build and other.build and self.build < other.build:
             return True
         if (
-            type(self.build_more) == int
-            and type(self.build_more) == type(other.build_more)
+            isinstance(self.build_more, int)
+            and type(self.build_more) is type(other.build_more)
             and self.build_more < other.build_more
         ):
             return True
@@ -175,5 +218,17 @@ class FilterDevice:
 
     mac: str | None = None
     name: str | None = None
-    state: int | None = None
+    type: str | None = None
     timemap: str = DEFAULT_PARENTAL_CONTROL_TIMEMAP
+
+
+@dataclass(frozen=True)
+class PortForwarding:
+    """Port forwarding class"""
+
+    name: str = str()
+    ip: str = str()
+    port: str = str()
+    protocol: str = str()
+    ip_external: str = str()
+    port_external: str = str()

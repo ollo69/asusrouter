@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import re
 from datetime import datetime, timedelta, timezone
-from dateutil.parser import parse as dtparse
 from typing import Any
+
+from dateutil.parser import parse as dtparse
 
 from asusrouter.error import AsusRouterValueError
 
@@ -27,11 +28,22 @@ ERROR_VALUE = "Wrong value: {} with original exception: {}"
 ERROR_VALUE_TYPE = "Wrong value {} of type {}"
 REGEX_MAC = re.compile("^([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})")
 
+CONNECTION_TYPE = {
+    "2G": 1,
+    "5G": 2,
+    "5G1": 3,
+    "5G2": 3,
+    "6G": 4,
+}
 
-def int_from_str(raw: str, base: int = 10) -> int:
-    """Convert string to integer"""
 
-    if type(raw) != str:
+def int_from_str(raw: str | int, base: int = 10) -> int:
+    """Convert to integer"""
+
+    if isinstance(raw, int):
+        return raw
+
+    if not isinstance(raw, str):
         raise AsusRouterValueError(ERROR_VALUE_TYPE.format(raw, type(raw)))
 
     raw = raw.strip()
@@ -42,22 +54,25 @@ def int_from_str(raw: str, base: int = 10) -> int:
     try:
         return int(raw, base=base)
     except ValueError as ex:
-        raise AsusRouterValueError(ERROR_VALUE.format(raw, str(ex)))
+        raise AsusRouterValueError(ERROR_VALUE.format(raw, str(ex))) from ex
 
 
 def clean_html(raw: str) -> str:
     """Clean html tags"""
 
-    if type(raw) != str:
+    if not isinstance(raw, str):
         raise AsusRouterValueError(ERROR_VALUE_TYPE.format(raw, type(raw)))
 
-    return re.sub("<([\/ibu]+)>", "", raw)
+    return re.sub(r"<([\/ibu]+)>", "", raw)
 
 
-def bool_or_int(raw: str, base: int = 10) -> bool | int:
+def bool_or_int(raw: str | bool, base: int = 10) -> bool | int:
     """Convert to bool or to int"""
 
-    if type(raw) != str:
+    if isinstance(raw, bool):
+        return raw
+
+    if not isinstance(raw, str):
         raise AsusRouterValueError(ERROR_VALUE_TYPE.format(raw, type(raw)))
 
     raw = clean_html(raw)
@@ -77,7 +92,7 @@ def bool_or_int(raw: str, base: int = 10) -> bool | int:
 def float_from_str(raw: str) -> float:
     """Convert striing to float"""
 
-    if type(raw) != str:
+    if not isinstance(raw, str):
         raise AsusRouterValueError(ERROR_VALUE_TYPE.format(raw, type(raw)))
 
     raw = raw.strip()
@@ -91,7 +106,7 @@ def float_from_str(raw: str) -> float:
     try:
         value = float(raw)
     except ValueError as ex:
-        raise AsusRouterValueError(ERROR_VALUE.format(raw, str(ex)))
+        raise AsusRouterValueError(ERROR_VALUE.format(raw, str(ex))) from ex
 
     return value
 
@@ -104,33 +119,39 @@ def bool_from_any(raw: str | int | float | bool) -> bool | None:
     if _type == bool:
         return raw
 
-    if _type == int or _type == float:
+    if _type in (int, float):
         if raw == 0:
             return False
-        else:
-            return True
+        return True
 
-    elif _type == str:
+    if _type == str:
         if raw.lower().strip() in BOOL_FALSE:
             return False
-        elif raw.lower().strip() in BOOL_TRUE:
+        if raw.lower().strip() in BOOL_TRUE:
             return True
-        elif raw == str():
+        if raw == str():
             return None
-        else:
-            raise AsusRouterValueError(ERROR_VALUE_TYPE.format(raw, type(raw)))
-
-    else:
         raise AsusRouterValueError(ERROR_VALUE_TYPE.format(raw, type(raw)))
+
+    raise AsusRouterValueError(ERROR_VALUE_TYPE.format(raw, type(raw)))
 
 
 def int_from_bool(raw: bool) -> int:
     """Convert boolean value to 0 or 1"""
 
-    if type(raw) != bool:
+    if not isinstance(raw, bool):
         raise AsusRouterValueError(ERROR_VALUE_TYPE.format(raw, type(raw)))
 
     return 1 if raw else 0
+
+
+def none_or_any(raw: Any) -> None | Any:
+    """Return value or process it with none_or_str"""
+
+    if isinstance(raw, str):
+        return none_or_str(raw)
+
+    return raw
 
 
 def none_or_str(raw: str) -> str | None:
@@ -139,7 +160,7 @@ def none_or_str(raw: str) -> str | None:
     if raw is None:
         return None
 
-    if type(raw) != str:
+    if not isinstance(raw, str):
         raise AsusRouterValueError(ERROR_VALUE_TYPE.format(raw, type(raw)))
 
     if raw.strip() == str():
@@ -151,7 +172,7 @@ def none_or_str(raw: str) -> str | None:
 def exists_or_not(raw: str) -> bool:
     """Returns whether value exists or is empty"""
 
-    if type(raw) != str:
+    if not isinstance(raw, str):
         raise AsusRouterValueError(ERROR_VALUE_TYPE.format(raw, type(raw)))
 
     if raw.strip() == str():
@@ -161,9 +182,10 @@ def exists_or_not(raw: str) -> bool:
 
 
 def timedelta_long(raw: str) -> timedelta:
-    """Transform connection timedelta of the device to a proper datetime object when the device was connected"""
+    """Transform connection timedelta of the device to a proper
+    datetime object when the device was connected"""
 
-    if type(raw) != str:
+    if not isinstance(raw, str):
         raise AsusRouterValueError(ERROR_VALUE_TYPE.format(raw, type(raw)))
 
     raw = raw.strip()
@@ -177,7 +199,7 @@ def timedelta_long(raw: str) -> timedelta:
             hours=int(part[-3]), minutes=int(part[-2]), seconds=int(part[-1])
         )
     except ValueError as ex:
-        raise (AsusRouterValueError(ERROR_VALUE.format(raw, str(ex))))
+        raise (AsusRouterValueError(ERROR_VALUE.format(raw, str(ex)))) from ex
 
 
 def time_from_delta(raw: str) -> datetime:
@@ -191,7 +213,7 @@ def time_from_delta(raw: str) -> datetime:
 def datetime_from_str(raw: str) -> datetime:
     """Transform string to datetime"""
 
-    if type(raw) != str:
+    if not isinstance(raw, str):
         raise AsusRouterValueError(ERROR_VALUE_TYPE.format(raw, type(raw)))
     raw = raw.strip()
     if raw == str():
@@ -206,7 +228,7 @@ def datetime_from_str(raw: str) -> datetime:
 def is_mac_address(raw: str) -> bool:
     """Checks if string is MAC address"""
 
-    if type(raw) != str:
+    if not isinstance(raw, str):
         raise AsusRouterValueError(ERROR_VALUE_TYPE.format(raw, type(raw)))
 
     raw = raw.strip()
@@ -223,10 +245,10 @@ def is_mac_address(raw: str) -> bool:
 def service_support(raw: str) -> list[str]:
     """Get the list of the supported services"""
 
-    if type(raw) != str:
+    if not isinstance(raw, str):
         raise AsusRouterValueError(ERROR_VALUE_TYPE.format(raw, type(raw)))
 
-    services = list()
+    services = []
 
     if raw == str():
         return services
@@ -240,7 +262,7 @@ def service_support(raw: str) -> list[str]:
 def ovpn_remote_fom_str(raw: str) -> dict[str, Any]:
     """Get OpenVPN remote data"""
 
-    if type(raw) != str:
+    if not isinstance(raw, str):
         raise AsusRouterValueError(ERROR_VALUE_TYPE.format(raw, type(raw)))
 
     try:
@@ -262,7 +284,7 @@ def ovpn_remote_fom_str(raw: str) -> dict[str, Any]:
 def to_snake_case(raw: str):
     """Convert string to snake_case"""
 
-    if type(raw) != str:
+    if not isinstance(raw, str):
         raise AsusRouterValueError(ERROR_VALUE_TYPE.format(raw, type(raw)))
 
     string = (
@@ -278,7 +300,29 @@ def to_snake_case(raw: str):
 def as_list(raw: Any):
     """Convert object into list of objects"""
 
-    if type(raw) != list:
+    if not isinstance(raw, list):
         return [raw]
 
     return raw
+
+
+def onboarding_connection(raw: str) -> dict[str, int]:
+    """Convert connection type from onboarding type to native type"""
+
+    if not isinstance(raw, str):
+        raise AsusRouterValueError(ERROR_VALUE_TYPE.format(raw, type(raw)))
+
+    if raw == "wired_mac":
+        return {
+            "connection_type": 0,
+            "guest": 0,
+        }
+
+    try:
+        temp = raw.split("_")
+        return {
+            "connection_type": CONNECTION_TYPE.get(temp[0]),
+            "guest": temp[1] if len(temp) > 1 else 0,
+        }
+    except Exception as ex:
+        raise ex

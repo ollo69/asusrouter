@@ -2,119 +2,97 @@
 
 from __future__ import annotations
 
-import logging
-from time import sleep
-
-_LOGGER = logging.getLogger(__name__)
-
 import json
+import logging
 import re
 from datetime import datetime, timedelta
-from dateutil.parser import parse as dtparse
 from typing import Any
 
 import xmltodict
+from dateutil.parser import parse as dtparse
 
 from asusrouter.const import (
-    AR_DEFAULT_CORES,
-    AR_DEFAULT_CORES_RANGE,
     AR_DEFAULT_LEDG,
-    AR_DEFAULT_OVPN_CLIENTS,
-    AR_DEFAULT_OVPN_SERVERS,
-    AR_DEVICE_ATTRIBUTES_LIST,
-    AR_KEY_CPU_ITEM,
-    AR_KEY_CPU_LIST,
-    AR_KEY_DEVICEMAP,
     AR_KEY_HEADER,
-    AR_KEY_NETWORK_GROUPS,
-    AR_KEY_NETWORK_ITEM,
-    AR_KEY_OVPN,
-    AR_KEY_OVPN_STATUS,
-    AR_KEY_OVPN_STATUS_SERVER,
-    AR_KEY_PARENTAL_CONTROL,
-    AR_KEY_PARENTAL_CONTROL_MAC,
-    AR_KEY_PARENTAL_CONTROL_NAME,
-    AR_KEY_PARENTAL_CONTROL_STATE,
-    AR_KEY_PARENTAL_CONTROL_TIMEMAP,
-    AR_KEY_RAM_ITEM,
-    AR_KEY_RAM_LIST,
-    AR_KEY_VPN_CLIENT,
-    AR_KEY_VPN_SERVER,
-    AR_KEY_WAN_STATE,
-    AR_MAP_PARENTAL_CONTROL_STATE,
     AR_MAP_RGB,
     AR_MAP_SYSINFO,
     AR_MAP_TEMPERATURE,
-    AR_PATH,
     CONST_BITSINBYTE,
     CONST_ZERO,
+    CPU,
     DATA_ADD_SPEED,
-    DATA_TOTAL,
-    DATA_TRAFFIC,
+    DEVICEMAP,
     DEVICEMAP_BY_INDEX,
     DEVICEMAP_CLEAR,
     DEVICEMAP_GENERAL,
-    ERROR_PARSING,
+    ENDPOINT,
     ERROR_VALUE,
     ERROR_VALUE_TYPE,
-    KEY_NETWORK,
+    FIRMWARE,
+    IP,
+    MAP_CPU,
+    MAP_NETWORK,
+    MAP_OVPN_CLIENT,
+    MAP_OVPN_SERVER,
+    MAP_RAM,
+    MAP_WAN,
+    MEM,
+    ONBOARDING,
     PARAM_IP,
     PARAM_RIP,
     PARAM_STATE,
-    PARAM_STATUS,
+    RANGE_CPU_CORES,
+    RANGE_OVPN_CLIENTS,
+    RANGE_OVPN_SERVERS,
     REGEX_VARIABLES,
+    RIP,
+    STATE,
+    STATUS,
+    SYSINFO,
+    TOTAL,
+    TRAFFIC_TYPE,
+    UPDATE_CLIENTS,
     VALUES_TO_IGNORE,
+    VPN,
+    VPN_CLIENT,
+    VPN_SERVER,
 )
-from asusrouter.dataclass import ConnectedDevice, FilterDevice, Firmware
-from asusrouter.error import AsusRouterNotImplementedError, AsusRouterValueError
+from asusrouter.dataclass import AiMeshDevice, Firmware
+from asusrouter.error import AsusRouterDataProcessError, AsusRouterValueError
 from asusrouter.util import calculators, converters
 
-
-def cpu_cores(raw: dict[str, Any] | None = None) -> list[int]:
-    """CPU cores parser"""
-
-    cores = list()
-
-    if raw is None:
-        return cores
-
-    for i in AR_DEFAULT_CORES_RANGE:
-        if any(
-            AR_KEY_CPU_ITEM.format(i, data_type) in raw for data_type in AR_KEY_CPU_LIST
-        ):
-            cores.append(i)
-        else:
-            break
-
-    return cores
+_LOGGER = logging.getLogger(__name__)
 
 
-def cpu_usage(
-    raw: dict[str, Any], cores: list[int] = AR_DEFAULT_CORES
-) -> dict[str, Any]:
+def cpu_usage(raw: dict[str, Any]) -> dict[str, Any]:
     """CPU usage parser"""
 
-    cpu = dict()
+    cpu = {}
 
     # Populate total
-    cpu[DATA_TOTAL] = dict()
-    for item in AR_KEY_CPU_LIST:
-        cpu[DATA_TOTAL][item.get()] = CONST_ZERO
+    cpu[TOTAL] = {}
+    for item in MAP_CPU:
+        cpu[TOTAL][item.get()] = CONST_ZERO
 
     # Data / core
-    for core in cores:
-        cpu[core] = dict()
+    for core in RANGE_CPU_CORES:
+        if not f"{CPU}{core}_{TOTAL}" in raw:
+            break
 
-        for item in AR_KEY_CPU_LIST:
-            key = AR_KEY_CPU_ITEM.format(core, item)
+        cpu[core] = {}
+
+        for item in MAP_CPU:
+            key = f"{CPU}{core}_{item}"
             new_key = item.get()
             if key in raw:
                 try:
                     cpu[core][new_key] = int(raw[key])
                 except ValueError as ex:
-                    raise (AsusRouterValueError(ERROR_VALUE.format(raw[key], str(ex))))
+                    raise (
+                        AsusRouterValueError(ERROR_VALUE.format(raw[key], str(ex)))
+                    ) from ex
                 # Add this to total as well
-                cpu[DATA_TOTAL][new_key] += cpu[core][new_key]
+                cpu[TOTAL][new_key] += cpu[core][new_key]
 
     return cpu
 
@@ -122,55 +100,39 @@ def cpu_usage(
 def ram_usage(raw: dict[str, Any]) -> dict[str, Any]:
     """RAM usage parser"""
 
-    ram = dict()
+    ram = {}
 
-    for item in AR_KEY_RAM_LIST:
-        if AR_KEY_RAM_ITEM.format(item) in raw:
+    for item in MAP_RAM:
+        if f"{MEM}_{item.value}" in raw:
             try:
-                ram[item] = int(raw[AR_KEY_RAM_ITEM.format(item)])
+                ram[item.get()] = int(raw[f"{MEM}_{item.value}"])
             except ValueError as ex:
                 raise (
                     AsusRouterValueError(
-                        ERROR_VALUE.format(raw[AR_KEY_RAM_ITEM.format(item)], str(ex))
+                        ERROR_VALUE.format(raw[f"{MEM}_{item.value}"], str(ex))
                     )
-                )
+                ) from ex
 
     return ram
 
 
-def network_usage(
-    raw: dict[str, Any], cache: dict[str, Any] | None = None
-) -> dict[str, Any]:
+def network_usage(raw: dict[str, Any]) -> dict[str, Any]:
     """Network usage parser"""
 
-    network = dict()
-    for group in AR_KEY_NETWORK_GROUPS:
-        for type in DATA_TRAFFIC:
-            if AR_KEY_NETWORK_ITEM.format(group, type) in raw:
-                if not AR_KEY_NETWORK_GROUPS[group] in network:
-                    network[AR_KEY_NETWORK_GROUPS[group]] = dict()
-                try:
-                    network[AR_KEY_NETWORK_GROUPS[group]][type] = int(
-                        raw[AR_KEY_NETWORK_ITEM.format(group, type)], base=16
-                    )
-                except ValueError as ex:
-                    raise (
-                        AsusRouterValueError(
-                            ERROR_VALUE.format(
-                                raw[AR_KEY_NETWORK_ITEM.format(group, type)], str(ex)
-                            )
-                        )
-                    )
-
-            elif (
-                cache is not None
-                and KEY_NETWORK in cache
-                and AR_KEY_NETWORK_GROUPS[group] in cache[DATA_TRAFFIC]
-                and type in cache[DATA_TRAFFIC][AR_KEY_NETWORK_GROUPS[group]]
-            ):
-                network[AR_KEY_NETWORK_GROUPS[group]][type] = cache[DATA_TRAFFIC][
-                    AR_KEY_NETWORK_GROUPS[group]
-                ][type]
+    network = {}
+    for interface in MAP_NETWORK:
+        data = {}
+        for traffic in TRAFFIC_TYPE:
+            try:
+                value = converters.int_from_str(
+                    raw.get(f"{interface.value}_{traffic}"), base=16
+                )
+                if value:
+                    data[traffic] = value
+            except Exception:
+                continue
+        if len(data) > 0:
+            network[interface.get()] = data
 
     return network
 
@@ -185,7 +147,8 @@ def network_speed(
 
     Parameters
     -----
-    `after`: current values. Outer dictionary `(groups)` contains inner dictionary `(types)`. On each `(type)` calculations are performed
+    `after`: current values. Outer dictionary `(groups)` contains inner dictionary `(types)`.
+    On each `(type)` calculations are performed
 
     `before`: previous values
 
@@ -198,7 +161,7 @@ def network_speed(
 
     for group in after:
         if group in before:
-            speed = dict()
+            speed = {}
             for type in after[group]:
                 if type in before[group]:
                     speed[
@@ -218,37 +181,22 @@ def network_speed(
 def wan_state(raw: dict[str, Any]) -> dict[str, Any]:
     """WAN status parser"""
 
-    values = dict()
+    values = {}
 
-    for key in AR_KEY_WAN_STATE:
+    for key in MAP_WAN:
         if key.value in raw and raw[key.value] != str():
             try:
                 values[key.get()] = (
                     key.method(raw[key.value]) if key.method else raw[key.value]
                 )
             except AsusRouterValueError as ex:
-                _LOGGER.warning(ERROR_PARSING.format(key.value, str(ex)))
+                _LOGGER.warning(
+                    "Failed parsing value '%s'. Please report this issue. Exception summary: %s",
+                    key.value,
+                    str(ex),
+                )
 
     return values
-
-
-def connected_device(raw: dict[str, Any]) -> ConnectedDevice:
-    """Device parser"""
-
-    values = dict()
-
-    for key in AR_DEVICE_ATTRIBUTES_LIST:
-        if key.value in raw and raw[key.value] != str():
-            try:
-                values[key.get()] = (
-                    key.method(raw[key.value]) if key.method else raw[key.value]
-                )
-            except AsusRouterValueError as ex:
-                _LOGGER.warning(ERROR_PARSING.format(key.value, str(ex)))
-
-    device = ConnectedDevice(**values)
-
-    return device
 
 
 def uptime(data: str) -> datetime:
@@ -260,26 +208,9 @@ def uptime(data: str) -> datetime:
         when = dtparse(part[0])
         boot = when - timedelta(seconds=seconds)
     except ValueError as ex:
-        raise (AsusRouterValueError(ERROR_VALUE.format(data, str(ex))))
+        raise (AsusRouterValueError(ERROR_VALUE.format(data, str(ex)))) from ex
 
     return boot
-
-
-def port_speed(value: str | None = None) -> int | None:
-    """Port speed -> Mb/s parcer"""
-
-    if value is None:
-        return None
-    elif value == "X":
-        return 0
-    elif value == "M":
-        return 100
-    elif value == "G":
-        return 1000
-    elif value == "Q":
-        return 2500
-    else:
-        raise (AsusRouterNotImplementedError(value))
 
 
 def devicemap(devicemap: dict[str, Any]) -> dict[str, Any]:
@@ -288,28 +219,28 @@ def devicemap(devicemap: dict[str, Any]) -> dict[str, Any]:
     data = {}
 
     # Get values only with index
-    for node in DEVICEMAP_BY_INDEX:
+    for node, body in DEVICEMAP_BY_INDEX.items():
         _node = {}
-        for key in DEVICEMAP_BY_INDEX[node]:
+        for key in body:
             for el in range(len(DEVICEMAP_BY_INDEX[node][key])):
                 _node[DEVICEMAP_BY_INDEX[node][key][el]] = devicemap[key][el]
             del devicemap[key][0 : (len(DEVICEMAP_BY_INDEX[node][key]) - 1)]
         data[node] = _node
 
     # Get values by key
-    for node in DEVICEMAP_GENERAL:
+    for node, body in DEVICEMAP_GENERAL.items():
         _node = {}
-        for key in DEVICEMAP_GENERAL[node]:
+        for key in body:
             for el in DEVICEMAP_GENERAL[node][key]:
                 if key in devicemap:
-                    if type(devicemap[key]) == str:
+                    if isinstance(devicemap[key], str):
                         if el in devicemap[key]:
-                            _node[el] = devicemap[key].replace("{}=".format(el), "")
+                            _node[el] = devicemap[key].replace(f"{el}=", "")
                             break
                     else:
                         for value in devicemap[key]:
                             if el in value:
-                                _node[el] = value.replace("{}=".format(el), "")
+                                _node[el] = value.replace(f"{el}=", "")
                                 break
         if node in data:
             data[node].update(_node)
@@ -317,8 +248,8 @@ def devicemap(devicemap: dict[str, Any]) -> dict[str, Any]:
             data[node] = _node
 
     # Clear values from useless symbols
-    for node in DEVICEMAP_CLEAR:
-        for value in DEVICEMAP_CLEAR[node]:
+    for node, body in DEVICEMAP_CLEAR.items():
+        for value in body:
             data[node][value] = data[node][value].replace(
                 DEVICEMAP_CLEAR[node][value], ""
             )
@@ -329,7 +260,7 @@ def devicemap(devicemap: dict[str, Any]) -> dict[str, Any]:
 def ledg_count(raw: str) -> int:
     """LEDG count parser"""
 
-    if type(raw) != str:
+    if not isinstance(raw, str):
         raise AsusRouterValueError(ERROR_VALUE_TYPE.format(raw, type(raw)))
     if raw.strip() == str():
         return {}
@@ -346,15 +277,15 @@ def ledg_count(raw: str) -> int:
 def temperatures(raw: str) -> dict[str, Any]:
     """Temperature parser"""
 
-    if type(raw) != str:
+    if not isinstance(raw, str):
         raise AsusRouterValueError(ERROR_VALUE_TYPE.format(raw, type(raw)))
     if raw.strip() == str():
         return {}
 
-    temp = dict()
+    temp = {}
 
-    for sensor in AR_MAP_TEMPERATURE:
-        for reg in AR_MAP_TEMPERATURE[sensor]:
+    for sensor, map in AR_MAP_TEMPERATURE.items():
+        for reg in map:
             value = re.search(reg, raw)
             if value:
                 temp[sensor] = float(value[1])
@@ -365,12 +296,12 @@ def temperatures(raw: str) -> dict[str, Any]:
 def rgb(raw: str, num: int = AR_DEFAULT_LEDG) -> dict[int, dict[str, int]]:
     """RGB to channels parser"""
 
-    if type(raw) != str:
+    if not isinstance(raw, str):
         raise AsusRouterValueError(ERROR_VALUE_TYPE.format(raw, type(raw)))
     if raw.strip() == str():
         return {}
 
-    leds = dict()
+    leds = {}
 
     color = re.findall("([0-9]+)", raw)
     length = len(color)
@@ -380,9 +311,9 @@ def rgb(raw: str, num: int = AR_DEFAULT_LEDG) -> dict[int, dict[str, int]]:
         if ind + 2 > length:
             break
         if not led in leds:
-            leds[led] = dict()
-        for channel in AR_MAP_RGB:
-            leds[led][AR_MAP_RGB[channel]] = color[ind + channel]
+            leds[led] = {}
+        for channel, code in AR_MAP_RGB.items():
+            leds[led][code] = color[ind + channel]
 
     return leds
 
@@ -393,13 +324,17 @@ def sysinfo(raw: str) -> dict[str, Any]:
     raw = raw.replace("=", '":')
     raw = raw.replace(";", ',"')
     raw = '{"' + raw[:-2] + "}"
-    data = json.loads(raw)
 
-    result = dict()
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as ex:
+        raise AsusRouterDataProcessError from ex
 
-    for set in AR_MAP_SYSINFO:
+    result = {}
+
+    for set, keys in AR_MAP_SYSINFO.items():
         if set in data:
-            for key in AR_MAP_SYSINFO[set]:
+            for key in keys:
                 try:
                     result[key.get()] = (
                         key.method(data[set][key.value])
@@ -407,7 +342,11 @@ def sysinfo(raw: str) -> dict[str, Any]:
                         else data[set][key.value]
                     )
                 except AsusRouterValueError as ex:
-                    _LOGGER.warning(ERROR_PARSING.format(key.value, str(ex)))
+                    _LOGGER.warning(
+                        "Failed parsing value '%s'. Please report this issue. Exception summary: %s",
+                        key.value,
+                        str(ex),
+                    )
 
     return result
 
@@ -415,72 +354,108 @@ def sysinfo(raw: str) -> dict[str, Any]:
 def onboarding(raw: str) -> dict[str, Any]:
     """Onboarding parser"""
 
+    raw = raw.replace("\ufeff", "")
     raw = raw.replace("=", '":')
     raw = raw.replace(";", ',"')
     raw = raw.replace("[0]", "")
     raw = '{"' + raw[:-2] + "}"
-    data = json.loads(raw)
 
-    result = dict()
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as ex:
+        raise AsusRouterDataProcessError from ex
 
     return data
 
 
-def parental_control(raw: dict[str, Any]) -> dict[str, Any]:
-    """Parental control parser"""
+def aimesh_node(raw: dict[str, Any]) -> AiMeshDevice:
+    """AiMesh node parser"""
 
-    result = dict()
+    AP = {
+        "2g": "2ghz",
+        "5g": "5ghz",
+        "5g1": "5ghz2",
+        "6g": "6ghz",
+        "dwb": "dwb",
+    }
 
-    result[AR_KEY_PARENTAL_CONTROL.get()] = AR_KEY_PARENTAL_CONTROL.method(
-        raw[AR_KEY_PARENTAL_CONTROL.value]
+    FREQUENCIES = [
+        "2g",
+        "5g",
+        "6g",
+    ]
+
+    ap = {}
+    for el, value in AP.items():
+        if f"ap{el}" in raw and raw[f"ap{el}"] is not str():
+            ap[value] = raw[f"ap{el}"]
+
+    parent = {}
+    for el in FREQUENCIES:
+        if f"pap{el}" in raw and raw[f"pap{el}"] is not str():
+            parent["connection"] = AP[el]
+            parent["mac"] = raw[f"pap{el}"]
+            parent["rssi"] = converters.none_or_str(raw.get(f"rssi{el}"))
+            parent["ssid"] = converters.none_or_str(raw.get(f"pap{el}_ssid"))
+
+    level = converters.int_from_str(raw.get("level", "0"))
+    state = "router" if level == 0 else "node"
+
+    return AiMeshDevice(
+        status=converters.bool_from_any(raw.get("online", 0)),
+        alias=raw.get("alias", None),
+        model=raw.get("ui_model_name", raw.get("model_name", None)),
+        product_id=raw.get("product_id"),
+        ip=raw.get("ip"),
+        fw=raw.get("fwver", None),
+        fw_new=converters.none_or_str(raw.get("newfwver")),
+        mac=raw.get("mac", None),
+        ap=ap,
+        parent=parent,
+        state=state,
+        level=level,
+        config=raw.get("config"),
     )
 
-    # If no rules are set
-    if raw.get(AR_KEY_PARENTAL_CONTROL_MAC) == raw.get(AR_KEY_PARENTAL_CONTROL_STATE):
-        result["list"] = dict()
-        return result
 
-    list = dict()
+def endpoint_update_clients(raw: str) -> dict[str, Any]:
+    """Parse data from the `update_clients` endpoint"""
 
-    for el in raw:
-        raw[el] = raw[el].split("&#62")
-
-    size = len(raw["MULTIFILTER_MAC"])
-
-    for i in range(0, size):
-        device = FilterDevice(
-            mac=raw[AR_KEY_PARENTAL_CONTROL_MAC][i],
-            name=raw[AR_KEY_PARENTAL_CONTROL_NAME][i],
-            state=AR_MAP_PARENTAL_CONTROL_STATE.get(
-                raw[AR_KEY_PARENTAL_CONTROL_STATE][i], None
-            ),
-            timemap=raw[AR_KEY_PARENTAL_CONTROL_TIMEMAP][i],
-        )
-        list[raw[AR_KEY_PARENTAL_CONTROL_MAC][i]] = device
-
-    result["list"] = list.copy()
-
-    return result
+    parts = raw.split("originData =")
+    parts = parts[1].split("networkmap_fullscan")
+    data = (
+        parts[0]
+        .replace("fromNetworkmapd", '"fromNetworkmapd"')
+        .replace("nmpClient ", '"nmpClient" ')
+    )
+    try:
+        return json.loads(data.encode().decode("utf-8-sig"))
+    except json.JSONDecodeError as ex:
+        raise AsusRouterDataProcessError from ex
 
 
 def pseudo_json(text: str, page: str) -> dict[str, Any]:
     """JSON parser"""
 
-    if page == AR_PATH["vpn"]:
-        return vpn_status(text)
-    if page == AR_PATH["firmware"]:
+    if ENDPOINT[FIRMWARE] in page:
         return firmware(text)
+    if ENDPOINT[STATE] in page:
+        return {}
+    if ENDPOINT[UPDATE_CLIENTS] in page:
+        return endpoint_update_clients(text)
+    if ENDPOINT[VPN] in page:
+        return vpn_status(text)
 
-    data = re.sub("\s+", "", text)
+    data = re.sub(r"\s+", "", text)
 
     if "curr_coreTmp" in data:
         return temperatures(data)
-    # Merlin v380
-    elif page == AR_PATH["sysinfo"]:
+    # Merlin
+    if ENDPOINT[SYSINFO] in page:
         return sysinfo(data)
-    elif page == AR_PATH["onboarding"]:
+    if ENDPOINT[ONBOARDING] in page:
         return onboarding(data)
-    elif "get_clientlist" in data:
+    if "get_clientlist" in data:
         data = data.replace('"get_clientlist":', '"get_clientlist":{')
         data += "}"
     elif "get_wan_lan_status=" in data:
@@ -491,18 +466,23 @@ def pseudo_json(text: str, page: str) -> dict[str, Any]:
         data = data.replace(";memInfo=", '},"memory":{')
         data = data.replace(";", "}}")
     else:
-        _LOGGER.error("Unknown data. Template for this data is unknown")
+        _LOGGER.error(
+            "Unknown data. Template for this data is unknown. Endpoint=%s}", page
+        )
         return {}
 
-    return json.loads(data.encode().decode("utf-8-sig"))
+    try:
+        return json.loads(data.encode().decode("utf-8-sig"))
+    except json.JSONDecodeError as ex:
+        raise AsusRouterDataProcessError from ex
 
 
-def xml(text: str, page: str) -> dict[str, Any]:
+def xml(text: str) -> dict[str, Any]:
     """XML parser"""
 
     data = xmltodict.parse(text)
-    if AR_KEY_DEVICEMAP in data:
-        return devicemap(data[AR_KEY_DEVICEMAP])
+    if DEVICEMAP in data:
+        return devicemap(data[DEVICEMAP])
 
     return {}
 
@@ -510,15 +490,15 @@ def xml(text: str, page: str) -> dict[str, Any]:
 def ovpn_client_status(raw: str) -> dict[str, Any]:
     """OpenVPN client status parser"""
 
-    if type(raw) != str:
+    if not isinstance(raw, str):
         raise AsusRouterValueError(ERROR_VALUE_TYPE.format(raw, type(raw)))
     raw = raw.strip()
     if raw == str() or raw == "None":
         return {}
 
-    values = dict()
+    values = {}
 
-    for key in AR_KEY_OVPN_STATUS:
+    for key in MAP_OVPN_CLIENT:
         if key.value in raw:
             value = re.search(f"{key.value},(.*?)(?=>)", raw)
             if value:
@@ -530,22 +510,22 @@ def ovpn_client_status(raw: str) -> dict[str, Any]:
 def ovpn_server_status(raw: str) -> dict[str, Any]:
     """OpenVPN server status parser"""
 
-    if type(raw) != str:
+    if not isinstance(raw, str):
         raise AsusRouterValueError(ERROR_VALUE_TYPE.format(raw, type(raw)))
     raw = raw.strip()
     if raw == str() or raw == "None":
         return {}
 
-    values = dict()
+    values = {}
 
-    for key in AR_KEY_OVPN_STATUS_SERVER:
+    for key in MAP_OVPN_SERVER:
         if key.value in raw:
             flag = False
             # Find headers
             header = re.search(f"{AR_KEY_HEADER},{key.value},(.*?)(?=>)", raw)
             if header:
                 keys_raw = header[1].split(",")
-                keys = list()
+                keys = []
                 for el in keys_raw:
                     keys.append(converters.to_snake_case(el))
                 flag = True
@@ -553,7 +533,7 @@ def ovpn_server_status(raw: str) -> dict[str, Any]:
             # Hide header
             raw = raw.replace(f"{AR_KEY_HEADER},{key.value},", "USED-")
 
-            values[key.get()] = list()
+            values[key.get()] = []
             # Find values
             while value := re.search(f"{key.value},(.*?)(?=>)", raw):
                 if not value:
@@ -561,7 +541,7 @@ def ovpn_server_status(raw: str) -> dict[str, Any]:
                 if flag:
                     cut = value[1].split(",")
                     i = 0
-                    set = dict()
+                    set = {}
                     while i < len(cut) and i < len(keys):
                         set[keys[i]] = cut[i]
                         i += 1
@@ -580,12 +560,12 @@ def ovpn_server_status(raw: str) -> dict[str, Any]:
 def variables(raw: str) -> dict[str, Any]:
     """Variables parser"""
 
-    if type(raw) != str:
+    if not isinstance(raw, str):
         raise AsusRouterValueError(ERROR_VALUE_TYPE.format(raw, type(raw)))
     if raw.strip() == str():
         return {}
 
-    values = dict()
+    values = {}
     temp = raw
     while len(temp) > 0:
         value = re.search(REGEX_VARIABLES, temp)
@@ -600,7 +580,7 @@ def variables(raw: str) -> dict[str, Any]:
 def firmware(raw: str) -> dict[str, Any]:
     """Firmware parser"""
 
-    if type(raw) != str:
+    if not isinstance(raw, str):
         raise AsusRouterValueError(ERROR_VALUE_TYPE.format(raw, type(raw)))
     if raw.strip() == str():
         return {}
@@ -610,18 +590,22 @@ def firmware(raw: str) -> dict[str, Any]:
     return values
 
 
-def firmware_string(raw: str) -> Firmware:
+def firmware_string(raw: str) -> Firmware | None:
     """Firmware string parser"""
 
-    if type(raw) != str:
+    if raw == str():
+        return None
+
+    if not isinstance(raw, str):
         raise AsusRouterValueError(ERROR_VALUE_TYPE.format(raw, type(raw)))
 
     string = re.match(
-        "^(3.?0.?0.?4)?[_.]?([0-9]{3})[_.]?([0-9]+)[_.-]?([a-zA-Z0-9-_]+)?$", raw
+        "^([39].?0.?0.?[46])?[_.]?([0-9]{3})[_.]?([0-9]+)[_.-]?([a-zA-Z0-9-_]+)?$", raw
     )
     if not string:
         _LOGGER.warning(
-            f"Firmware version cannot be parser. Please report this. The original FW string is: {raw}"
+            "Firmware version cannot be parsed. Please report this. The original FW string is: %s",
+            raw,
         )
         return Firmware()
 
@@ -631,7 +615,9 @@ def firmware_string(raw: str) -> Firmware:
 
     minor = int(string[2])
     build = int(string[3])
-    if string[4] and string[4].isdigit():
+    if not string[4]:
+        build_more = 0
+    elif string[4].isdigit():
         build_more = int(string[4])
     else:
         build_more = string[4]
@@ -650,58 +636,58 @@ def firmware_string(raw: str) -> Firmware:
 def vpn_status(raw: str) -> dict[str, Any]:
     """VPN status parser"""
 
-    if type(raw) != str:
+    if not isinstance(raw, str):
         raise AsusRouterValueError(ERROR_VALUE_TYPE.format(raw, type(raw)))
     if raw.strip() == str():
         return {}
 
-    vpns = dict()
+    vpns = {}
 
     values = variables(raw)
 
     # Clients
-    for num in range(1, AR_DEFAULT_OVPN_CLIENTS + 1):
-        key = AR_KEY_OVPN.format(AR_KEY_VPN_CLIENT, num, PARAM_STATUS)
+    for num in RANGE_OVPN_CLIENTS:
+        key = f"{VPN_CLIENT}{num}_{STATUS}"
         if not key in values:
             break
 
-        vpn_id = AR_KEY_VPN_CLIENT + str(num)
+        vpn_id = VPN_CLIENT + str(num)
 
         if values[key] not in VALUES_TO_IGNORE:
             vpns[vpn_id] = ovpn_client_status(values[key])
             vpns[vpn_id][PARAM_STATE] = True
         else:
-            vpns[vpn_id] = dict()
+            vpns[vpn_id] = {}
             vpns[vpn_id][PARAM_STATE] = False
 
-        key = AR_KEY_OVPN.format(AR_KEY_VPN_CLIENT, num, PARAM_IP)
+        key = f"{VPN_CLIENT}{num}_{IP}"
         if key in values and values[key] not in VALUES_TO_IGNORE:
             vpns[vpn_id][PARAM_IP] = values[key]
 
-        key = AR_KEY_OVPN.format(AR_KEY_VPN_CLIENT, num, PARAM_RIP)
+        key = f"{VPN_CLIENT}{num}_{RIP}"
         if key in values and values[key] not in VALUES_TO_IGNORE:
             vpns[vpn_id][PARAM_RIP] = values[key]
 
     # Servers
-    for num in range(1, AR_DEFAULT_OVPN_SERVERS + 1):
-        key = AR_KEY_OVPN.format(AR_KEY_VPN_SERVER, num, PARAM_STATUS)
+    for num in RANGE_OVPN_SERVERS:
+        key = f"{VPN_SERVER}{num}_{STATUS}"
         if not key in values:
             break
 
-        vpn_id = AR_KEY_VPN_SERVER + str(num)
+        vpn_id = VPN_SERVER + str(num)
 
         if values[key] not in VALUES_TO_IGNORE:
             vpns[vpn_id] = ovpn_server_status(values[key])
             vpns[vpn_id][PARAM_STATE] = True
         else:
-            vpns[vpn_id] = dict()
+            vpns[vpn_id] = {}
             vpns[vpn_id][PARAM_STATE] = False
 
-        key = AR_KEY_OVPN.format(AR_KEY_VPN_SERVER, num, PARAM_IP)
+        key = f"{VPN_SERVER}{num}_{IP}"
         if key in values and values[key] not in VALUES_TO_IGNORE:
             vpns[vpn_id][PARAM_IP] = values[key]
 
-        key = AR_KEY_OVPN.format(AR_KEY_VPN_SERVER, num, PARAM_RIP)
+        key = f"{VPN_SERVER}{num}_{RIP}"
         if key in values and values[key] not in VALUES_TO_IGNORE:
             vpns[vpn_id][PARAM_RIP] = values[key]
 

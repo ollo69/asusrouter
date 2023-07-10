@@ -45,6 +45,10 @@ class AsusRouterLoginError(AsusRouterError):
     """Login error / credentials error"""
 
 
+class AsusRouterLoginAnotherError(AsusRouterError):
+    """Login is blocked until another user logs out"""
+
+
 class AsusRouterLoginBlockError(AsusRouterError):
     """Too many attempts error on device side"""
 
@@ -68,12 +72,24 @@ class AsusRouterLoginBlockError(AsusRouterError):
         return self._timeout
 
 
+class AsusRouterLoginCaptchaError(AsusRouterError):
+    """Captcha is required from device"""
+
+
+class AsusRouterResetRequiredError(AsusRouterError):
+    """Too many attempts to use wrong credentials. Reset required"""
+
+
 class AsusRouterResponseError(AsusRouterError):
     """Error on communication"""
 
 
 class AsusRouterServiceError(AsusRouterError):
     """Error on calling a service"""
+
+
+class AsusRouterDataProcessError(AsusRouterError):
+    """Error on processing data"""
 
 
 class AsusRouterValueError(AsusRouterError, ValueError):
