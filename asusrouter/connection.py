@@ -1,4 +1,7 @@
-"""Connection module"""
+"""Connection module.
+
+This module handles the connection between the library and the router 
+as well as all the data transfer."""
 
 from __future__ import annotations
 
@@ -6,397 +9,312 @@ import asyncio
 import base64
 import json
 import logging
-import urllib.parse
-from typing import Any
+from typing import Any, Awaitable, Callable, Optional, Tuple
+from urllib.parse import quote
 
 import aiohttp
 
-from asusrouter import (
-    AsusRouter404,
-    AsusRouterAuthorizationError,
-    AsusRouterConnectionError,
-    AsusRouterConnectionTimeoutError,
-    AsusRouterError,
-    AsusRouterLoginBlockError,
-    AsusRouterLoginError,
-    AsusRouterResponseError,
-    AsusRouterServerDisconnectedError,
-    AsusRouterSSLError,
-)
-from asusrouter.const import (
-    ANOTHER,
-    AR_API,
-    AR_ERROR_CODE,
-    AR_USER_AGENT,
-    AUTHORIZATION,
-    CAPTCHA,
-    CREDENTIALS,
-    DEFAULT_PORT,
-    DEFAULT_SLEEP_CONNECTING,
-    DEFAULT_SLEEP_RECONNECT,
-    ENDPOINT,
-    ENDPOINT_LOGIN,
-    ENDPOINT_LOGOUT,
-    ERROR_STATUS,
-    HOOK,
-    HTTP,
-    HTTPS,
-    LOGOUT,
-    RESET_REQUIRED,
-    SUCCESS,
-    TRY_AGAIN,
-)
+from asusrouter.const import DEFAULT_TIMEOUTS, USER_AGENT
 from asusrouter.error import (
-    AsusRouterLoginAnotherError,
-    AsusRouterLoginCaptchaError,
-    AsusRouterResetRequiredError,
+    AsusRouter404Error,
+    AsusRouterAccessError,
+    AsusRouterConnectionError,
+    AsusRouterError,
+    AsusRouterLogoutError,
+    AsusRouterSessionError,
+    AsusRouterTimeoutError,
 )
-from asusrouter.util import converters, parsers
+from asusrouter.modules.endpoint import Endpoint, EndpointControl, EndpointService
+from asusrouter.modules.endpoint.error import AccessError, handle_access_error
 
 _LOGGER = logging.getLogger(__name__)
 
 
-class Connection:
-    """Create connection"""
+def generate_credentials(username: str, password: str) -> Tuple[str, dict[str, str]]:
+    """Generate credentials for connection"""
 
-    def __init__(
+    auth = f"{username}:{password}".encode("ascii")
+    logintoken = base64.b64encode(auth).decode("ascii")
+    payload = f"login_authorization={logintoken}"
+    headers = {"user-agent": "asusrouter--DUTUtil-"}
+
+    return payload, headers
+
+
+class Connection:  # pylint: disable=too-many-instance-attributes
+    """A connection between the library and the device."""
+
+    # A token for the current session
+    _token: Optional[str] = None
+    # A header to use in the current session
+    _header: Optional[dict[str, str]] = None
+
+    # SSL
+    _ssl = False
+
+    # Connection status
+    _connected: bool = False
+    _connection_lock: asyncio.Lock = asyncio.Lock()
+
+    def __init__(  # pylint: disable=too-many-arguments
         self,
-        host: str,
+        hostname: str,
         username: str,
         password: str,
-        port: int | None = None,
+        port: Optional[int] = None,
         use_ssl: bool = False,
-        session: aiohttp.ClientSession | None = None,
+        session: Optional[aiohttp.ClientSession] = None,
+        dumpback: Optional[Callable[..., Awaitable[None]]] = None,
     ):
-        """Properties for connection"""
+        """Initialize connection."""
 
-        self._host: str | None = host
-        self._port: int | None = port
-        self._username: str | None = username
-        self._password: str | None = password
-        self._token: str | None = None
-        self._headers: dict[str, str] | None = None
-        self._session: aiohttp.ClientSession | None = session
+        _LOGGER.debug("Initializing a new connection to `%s`", hostname)
 
-        self._device: dict[str, str] = {}
-        self._error: bool = False
-        self._connecting: bool = False
-        self._mute_flag: bool = False
-        self._drop: bool = False
+        # Hostname and credentials
+        self._hostname = hostname
+        self._username = username
+        self._password = password
 
-        self._http = HTTPS if use_ssl else HTTP
-        self._ssl = False
+        # Client session
+        self._session = session if session is not None else aiohttp.ClientSession()
+        _LOGGER.debug("Using session `%s`", session)
 
-        if self._port is None or self._port == 0:
-            self._port = DEFAULT_PORT[self._http]
+        # Set the port and protocol based on the input
+        self._http = "https" if use_ssl else "http"
+        self._port = port or (8443 if use_ssl else 80)
+        _LOGGER.debug("Using `%s` and port `%s`", self._http, self._port)
 
-        self._connected: bool = None
+        # Callback for dumping data
+        self._dumpback = dumpback
 
-    async def async_run_command(
-        self, command: str, endpoint: str = ENDPOINT[HOOK], retry: bool = False
-    ) -> dict[str, Any]:
-        """Run command. Use the existing connection token, otherwise create new one"""
+    async def async_connect(
+        self, retry: int = 0, lock: Optional[asyncio.Lock] = None
+    ) -> bool:
+        """Connect to the device and get a new auth token."""
 
-        if self._drop:
-            return {}
+        # Check that we are connected so that we don't try to go through lock again
+        if self._connected:
+            _LOGGER.debug("Already connected to %s", self._hostname)
+            return True
 
-        if self._token is None and not retry:
-            _LOGGER.debug("No token - connecting and repeating")
-            await self.async_connect()
-            return await self.async_run_command(command, endpoint, retry=True)
-        if self._token is not None:
+        _lock = lock or self._connection_lock
+
+        async with _lock:
+            # Again check if we are connected and return if we are
+            if self._connected:
+                return True
+
+            _LOGGER.debug("Initializing connection to %s", self._hostname)
+            self._connected = False
+
+            # Generate payload and header for login request
+            payload, headers = generate_credentials(self._username, self._password)
+
+            # Request authotization
+            _LOGGER.debug("Requesting authorization")
             try:
-                result = await self.async_request(command, endpoint, self._headers)
-                return result
-            except AsusRouterAuthorizationError as ex:
-                if not retry:
-                    await self.async_connect()
-                    return await self.async_run_command(command, endpoint, retry=True)
-                raise ex
-            except AsusRouterError as ex:
-                raise ex
-            except Exception as ex:
-                if not retry:
-                    await self.async_connect()
-                    return await self.async_run_command(command, endpoint, retry=True)
-                raise ex
-        else:
-            _LOGGER.error("Error sending a command to `%s`", endpoint)
-            return {}
-
-    async def async_load(self, endpoint: str, retry: bool = False) -> str:
-        """Load the page"""
-
-        if self._drop:
-            return {}
-
-        if self._token is None and not retry:
-            await self.async_connect()
-            return await self.async_load(endpoint, retry=True)
-
-        string_body = str()
-
-        try:
-            async with self._session.post(
-                url=f"{self._http}://{self._host}:{self._port}/{endpoint}",
-                headers=self._headers,
-                ssl=self._ssl,
-            ) as reply:
-                string_body = await reply.text()
-                if "404 Not Found" in string_body:
-                    raise AsusRouter404()
-        except (aiohttp.ClientError, asyncio.TimeoutError) as ex:
-            if not retry:
-                return self.async_load(endpoint, retry=True)
-            raise AsusRouterConnectionError(ex) from ex
-        except Exception as ex:
-            raise ex
-
-        return string_body
-
-    async def async_request(
-        self, payload: str, endpoint: str, headers: dict[str, str], retry: bool = False
-    ) -> dict[str, Any]:
-        """Send a request"""
-
-        if self._drop:
-            return {}
-
-        # Wait a bit before just retrying
-        if retry:
-            await asyncio.sleep(DEFAULT_SLEEP_RECONNECT)
-
-        # Connection process
-        if endpoint == ENDPOINT_LOGIN:
-            self._connecting = True
-        # Sleep if we got here during the connection process
-        else:
-            while self._connecting:
-                await asyncio.sleep(DEFAULT_SLEEP_CONNECTING)
-
-        json_body = {}
-
-        try:
-            async with self._session.post(
-                url=f"{self._http}://{self._host}:{self._port}/{endpoint}",
-                data=urllib.parse.quote(payload),
-                headers=headers,
-                ssl=self._ssl,
-            ) as reply:
-                string_body = await reply.text()
-                if string_body == str():
-                    return {}
-                if "404 Not Found" in string_body:
-                    raise AsusRouter404()
-                json_body = await reply.json()
-
-                # Handle reported errors
-                if ERROR_STATUS in json_body:
-                    # If got here, we are not connected properly
-                    self._connected = False
-
-                    # ERROR CODES
-                    error_code = int(json_body[ERROR_STATUS])
-                    # Not authorized
-                    if error_code == AR_ERROR_CODE[AUTHORIZATION]:
-                        raise AsusRouterAuthorizationError("Session is not authorized")
-                    # Captcha required
-                    if error_code == AR_ERROR_CODE[CAPTCHA]:
-                        raise AsusRouterLoginCaptchaError("Device requires captcha")
-                    # Wrong crerdentials
-                    if error_code == AR_ERROR_CODE[CREDENTIALS]:
-                        raise AsusRouterLoginError("Wrong credentials")
-                    # Too many attempts
-                    if error_code == AR_ERROR_CODE[TRY_AGAIN]:
-                        raise AsusRouterLoginBlockError(
-                            "Too many attempts to login",
-                            timeout=converters.int_from_str(
-                                json_body["remaining_lock_time"]
-                            ),
-                        )
-                    # 10 wrong attempts - device blocked
-                    if error_code == AR_ERROR_CODE[RESET_REQUIRED]:
-                        raise AsusRouterResetRequiredError(
-                            "Device is blocked of the number of failed logins. Reset the device"
-                        )
-                    # Another user should log out
-                    if error_code == AR_ERROR_CODE[ANOTHER]:
-                        raise AsusRouterLoginAnotherError(
-                            "Another user should log out first"
-                        )
-                    # Loged out
-                    if error_code == AR_ERROR_CODE[LOGOUT]:
-                        return {SUCCESS: True}
-                    # Unknown error code
-                    raise AsusRouterResponseError(
-                        f"Unknown error code `{error_code}`, please report it"
-                    )
-
-            # If loged in, save the device API data
-            if endpoint == ENDPOINT_LOGIN:
-                r_headers = reply.headers
-                for item in AR_API:
-                    if item in r_headers:
-                        self._device[item] = r_headers[item]
-
-            # Reset mute_flag on success
-            self._mute_flag = False
-
-            return json_body
-
-        # Handle non-JSON replies
-        except json.JSONDecodeError:
-            if ".xml" in endpoint:
-                json_body = parsers.xml(text=string_body)
-            else:
-                json_body = parsers.pseudo_json(text=string_body, page=endpoint)
-            return json_body
-
-        # Raise only if mute_flag not set
-        except aiohttp.ClientSSLError as ex:
-            if not self._mute_flag:
-                raise AsusRouterSSLError() from ex
-        except (aiohttp.ServerTimeoutError, asyncio.TimeoutError) as ex:
-            if not self._mute_flag:
-                raise AsusRouterConnectionTimeoutError() from ex
-        # This happens regularly if more connections are established.
-        # Repeat before actually raising the exception
-        except aiohttp.ServerDisconnectedError as ex:
-            if retry:
-                raise AsusRouterServerDisconnectedError(ex) from ex
-            _LOGGER.debug(
-                "Disconnected by the device while quering '%s' with payload '%s'. "
-                "Everything should recover by itself. If this warning appears regularly, "
-                "you might need to decrease the number of simultaneous connections "
-                "to your device",
-                endpoint,
-                payload,
-            )
-
-        # Connection refused or reset by peer -> will repeat
-        except (aiohttp.ClientOSError) as ex:
-            if endpoint == ENDPOINT_LOGIN and not self._mute_flag:
-                raise AsusRouterConnectionError(str(ex)) from ex
-            # Mute warning for retries and while connecting
-            if not retry and not self._connecting:
-                _LOGGER.debug(
-                    "Connection refused. Endpoint: %s. Payload: %s.\nException summary: %s",
-                    endpoint,
-                    payload,
-                    str(ex),
+                _, _, resp_content = await self._send_request(
+                    EndpointService.LOGIN, payload, headers
                 )
+                _LOGGER.debug("Received authorization response")
+            except AsusRouterAccessError as ex:
+                raise AsusRouterAccessError(
+                    f"Cannot access {EndpointService.LOGIN}. Failed in `async_connect`"
+                ) from ex
+            except AsusRouterError as ex:
+                _LOGGER.debug("Connection failed with error: %s", ex)
+                if retry < len(DEFAULT_TIMEOUTS) - 1:
+                    _LOGGER.debug(
+                        "Will try again in %s seconds", DEFAULT_TIMEOUTS[retry]
+                    )
+                    await asyncio.sleep(DEFAULT_TIMEOUTS[retry])
+                    return await self.async_connect(retry + 1, asyncio.Lock())
+                raise AsusRouterTimeoutError(
+                    f"Reached maximum allowed timeout\
+                        for a single connection attempt: {sum(DEFAULT_TIMEOUTS)}"
+                ) from ex
+            except Exception as ex:  # pylint: disable=broad-except
+                _LOGGER.debug("Error while connecting to %s: %s", self._hostname, ex)
+                raise ex
 
-        # If it got here, something is wrong. Reconnect and retry
-        self._mute_flag = True
+            # Convert the response to JSON
+            content = json.loads(resp_content)
+            # Get the auth_token value from the headers
+            self._token = content.get("asus_token")
+            if not self._token:
+                _LOGGER.error("No token received")
+                return False
 
-        if not retry:
-            self._error = True
-            _LOGGER.debug("Reconnecting")
-            await self.async_cleanup()
-            await self.async_connect(retry=True)
-        return await self.async_request(
-            payload=payload, endpoint=endpoint, headers=headers, retry=True
-        )
-
-    async def async_connect(self, retry: bool = False) -> bool:
-        """Start new connection to and get new auth token"""
-
-        _LOGGER.debug("Trying to connect")
-
-        _success = False
-        self._drop = False
-
-        if self._session is None:
-            _LOGGER.debug("No client session provided. Starting a new session")
-            self._session = aiohttp.ClientSession()
-
-        auth = f"{self._username}:{self._password}".encode("ascii")
-        logintoken = base64.b64encode(auth).decode("ascii")
-        payload = f"login_authorization={logintoken}"
-        headers = {"user-agent": AR_USER_AGENT}
-
-        _LOGGER.debug("Sending connection request")
-        response = await self.async_request(
-            payload=payload, endpoint=ENDPOINT_LOGIN, headers=headers, retry=retry
-        )
-        if "asus_token" in response:
-            self._token = response["asus_token"]
-            self._headers = {
-                "user-agent": AR_USER_AGENT,
+            # Set the header
+            self._header = {
+                "user-agent": USER_AGENT,
                 "cookie": f"asus_token={self._token}",
             }
-            _LOGGER.debug("Login successful on port `%s`: %s", self._port, self._device)
 
+            # Mark as connected
             self._connected = True
-            _success = True
-        else:
-            _LOGGER.error("Cannot recieve a token from device")
+            _LOGGER.debug("Connected to %s", self._hostname)
 
-        self._connecting = False
-
-        return _success
+            return True
 
     async def async_disconnect(self) -> bool:
-        """Close the connection"""
+        """Disconnect from the device."""
 
-        # Not connected
+        _LOGGER.debug("Initializing disconnection from %s", self._hostname)
+
+        # Check that we are connected
         if not self._connected:
-            _LOGGER.debug("Not connected")
-        # Connected
-        else:
+            _LOGGER.debug("Not connected to %s", self._hostname)
+            return True
+
+        # Request logout
+        try:
+            await self._send_request(EndpointService.LOGOUT)
+        except AsusRouterLogoutError:
+            # Loged out successfully
+            self.reset_connection()
+            _LOGGER.debug("Disconnected from %s", self._hostname)
+            return True
+        except AsusRouterError as ex:
+            _LOGGER.debug("Error while disconnecting from %s: %s", self._hostname, ex)
+            return False
+
+        # Anything else would mean error when disconnecting
+        return False
+
+    async def _send_request(
+        self,
+        endpoint: Endpoint | EndpointControl | EndpointService,
+        payload: Optional[str] = None,
+        headers: Optional[dict[str, str]] = None,
+    ) -> Tuple[int, dict[str, str], str]:
+        """Send a request to the device."""
+
+        # Send request
+        try:
+            resp_status, resp_headers, resp_content = await self._make_post_request(
+                endpoint,
+                payload,
+                headers,
+            )
+
+            # Raise exception on 404
+            if resp_status == 404:
+                raise AsusRouter404Error(f"Endpoint {endpoint} not found")
+
+            # Raise exception on non-200 status
+            if resp_status != 200:
+                raise AsusRouterAccessError(
+                    f"Cannot access {endpoint}, status {resp_status}"
+                )
+
+            # Check for access errors
+            if "error_status" in resp_content:
+                return handle_access_error(
+                    endpoint, resp_status, resp_headers, resp_content
+                )
+
+            return (resp_status, resp_headers, resp_content)
+        except aiohttp.ClientConnectorError as ex:
+            self.reset_connection()
+            raise AsusRouterConnectionError(
+                f"Cannot connect to {self._hostname}. Failed in `_send_request`"
+            ) from ex
+        except (aiohttp.ClientConnectionError, aiohttp.ClientOSError) as ex:
+            raise AsusRouterConnectionError(
+                f"Cannot connect to {self._hostname}. Failed in `_send_request`"
+            ) from ex
+        except Exception as ex:  # pylint: disable=broad-except
+            raise ex
+
+    async def async_query(
+        self,
+        endpoint: Endpoint | EndpointControl | EndpointService,
+        payload: Optional[str] = None,
+        headers: Optional[dict[str, str]] = None,
+    ) -> Tuple[int, dict[str, str], str]:
+        """Send a request to the device."""
+
+        # If not connected, try to connect
+        if not self._connected:
+            _LOGGER.debug("Not connected to %s. Connecting...", self._hostname)
+            await self.async_connect()
+
+        # If still not connected, raise an error
+        if not self._connected:
+            raise AsusRouterTimeoutError("Data cannot be retrieved. Connection failed")
+
+        # Send the request
+        _LOGGER.debug("Sending request to %s", self._hostname)
+        return await self._send_request(endpoint, payload, headers)
+
+    async def _make_post_request(
+        self,
+        endpoint: Endpoint | EndpointControl | EndpointService,
+        payload: Optional[str] = None,
+        headers: Optional[dict[str, str]] = None,
+    ) -> Any:
+        """Make a post request to the device."""
+
+        # Check if a session is available
+        if self._session is None or self._session.closed:
+            # If no session is available, we cannot be connected to the device
+            # So we don't try to make any requests
+            raise AsusRouterSessionError("No session available for this connection")
+
+        # Check headers
+        if not headers:
+            headers = self._header
+
+        # Generate the url
+        url = f"{self._http}://{self._hostname}:{self._port}/{endpoint.value}"
+
+        # Process the payload to be sent
+        payload_to_send = quote(payload) if payload else None
+
+        # Send the request
+        async with self._session.post(
+            url,
+            data=payload_to_send,
+            headers=headers,
+            ssl=self._ssl,
+        ) as response:
+            # Read the status code
+            resp_status = response.status
+
+            # Read the response headers
+            resp_headers = response.headers
+
+            # Read the response
             try:
-                result = await self.async_request("", ENDPOINT_LOGOUT, self._headers)
-                if SUCCESS not in result:
-                    return False
-            except AsusRouterAuthorizationError:
-                _LOGGER.debug("Connection was already droped")
+                resp_content = await response.text()
+            except UnicodeDecodeError:
+                _LOGGER.debug("Cannot decode response. Will ignore errors")
+                resp_content = await response.text(errors="ignore")
 
-        # Clean up
-        await self.async_cleanup()
+            # Call the dumpback if available
+            if self._dumpback is not None:
+                await self._dumpback(
+                    endpoint, payload, resp_status, resp_headers, resp_content
+                )
 
-        return True
+            # Return the response
+            return (resp_status, resp_headers, resp_content)
 
-    async def async_drop_connection(self) -> None:
-        """Drop connection"""
+    def reset_connection(self):
+        """Reset connection variables."""
 
-        self._drop = True
-        await self.async_cleanup()
+        if not self._connected:
+            return
 
-    async def async_cleanup(self) -> None:
-        """Cleanup after logout"""
-
-        _LOGGER.debug("Cleaning up")
+        _LOGGER.debug("Resetting connection to %s", self._hostname)
 
         self._connected = False
         self._token = None
-        self._headers = None
-
-    async def async_reset_error(self) -> None:
-        """Reset error flag"""
-
-        self._error = False
-        return
+        self._header = None
 
     @property
     def connected(self) -> bool:
-        """Connection status"""
+        """Return connection status."""
 
         return self._connected
-
-    @property
-    def connecting(self) -> bool:
-        """Connection progress"""
-
-        return self._connecting
-
-    @property
-    def device(self) -> dict[str, str]:
-        """Device model and API support levels"""
-
-        return self._device
-
-    @property
-    def error(self) -> bool:
-        """Report errors"""
-
-        return self._error
